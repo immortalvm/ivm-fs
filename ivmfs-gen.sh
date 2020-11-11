@@ -101,7 +101,8 @@ print_preamble() {
 #define IVMFS_DUMPFILES
 #endif
 
-typedef long fid_t;
+// Declare fid_t as int to be coherent with unistd.h declarations
+typedef int fid_t;
 
 static fid_t ofiles = FIRST_FILENO; //ever opened files
 
@@ -302,7 +303,7 @@ int open(const char *name, int flags, ...)
             }
 
             #ifdef IVMFS_DEBUG
-                fprintf(stderr, "[open] OK name=%s, flags=0x%x, fid=%ld\n", name, flags, ofiles);
+                fprintf(stderr, "[open] OK name=%s, flags=0x%x, fid=%d\n", name, flags, ofiles);
             #endif
 
             return filesystem[idx].fid;
@@ -321,7 +322,7 @@ int open(const char *name, int flags, ...)
             filesystem[idx].flags = flags;
             filesystem[idx].allocated = 0;
             #ifdef IVMFS_DEBUG
-                fprintf(stderr, "[open] NEW file: name=%s, flags=0x%x, idx=%ld, fid=%ld\n", name, flags, idx, ofiles);
+                fprintf(stderr, "[open] NEW file: name=%s, flags=0x%x, idx=%ld, fid=%d\n", name, flags, idx, ofiles);
             #endif
             return filesystem[idx].fid;
         } else {
@@ -355,11 +356,13 @@ static fid_t get_stdin_fileno(void){
     return stdin_fid;
 }
 
-ssize_t read(fid_t fid, char *buf, size_t len)
+ssize_t read(fid_t fid, void *vbuf, size_t len)
 {
     #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[read] fid=%ld len=%ld\n", fid, len);
+        fprintf(stderr, "[read] fid=%d len=%ld\n", fid, len);
     #endif
+
+    char *buf = (char*)vbuf;
 
     if (STDIN_FILENO == fid){
         fid = get_stdin_fileno();
@@ -385,7 +388,7 @@ ssize_t read(fid_t fid, char *buf, size_t len)
 int close (fid_t fid)
 {
     #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[close] fid=%ld\n", fid);
+        fprintf(stderr, "[close] fid=%d\n", fid);
     #endif
 
     if (fid < FIRST_FILENO){
@@ -407,7 +410,7 @@ int close (fid_t fid)
 off_t lseek (fid_t file, off_t offset, int whence)
 {
     #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[lseek] fid=%ld, offset=%ld, whence=%d\n", file, offset, whence);
+        fprintf(stderr, "[lseek] fid=%d, offset=%ld, whence=%d\n", file, offset, whence);
     #endif
 
     long idx;
@@ -464,11 +467,13 @@ static int _IVM64_putchar(int arg)
     return retval;
 }
 
-ssize_t write(fid_t fid, char *ptr, size_t nbytes)
+ssize_t write(fid_t fid, const void *vptr, size_t nbytes)
 {
     int cont;
     char c;
     unsigned long allocated;
+
+    char *ptr = (char*)vptr;
 
     if ((fid == STDOUT_FILENO) || (fid == STDERR_FILENO))
     {
@@ -483,7 +488,7 @@ ssize_t write(fid_t fid, char *ptr, size_t nbytes)
         #ifdef IVMFS_DEBUG
             // Never debug writing in stderr/stdout as it will
             // result in infinity recursion
-            fprintf(stderr, "[write] fid=%ld, nbytes=%ld, pos=%ld\n", fid, nbytes, (idx<0)?-1:filesystem[idx].pos);
+            fprintf(stderr, "[write] fid=%d, nbytes=%ld, pos=%ld\n", fid, nbytes, (idx<0)?-1:filesystem[idx].pos);
         #endif
 
         if (idx < 0) {

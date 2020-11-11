@@ -16,7 +16,7 @@ all: checkenv
 	@cd run ; \
     grep ivm64 ../libz.so | grep version |sort -u > lib.ver ; \
     grep ivm64 minigzip | grep version |sort -u > exe.ver ; \
-	if ! cmp lib.ver exe.ver ; then echo "Library version mismatch"; exit 1; fi
+	if ! cmp lib.ver exe.ver ; then echo "Library version mismatch (try recompiling libz.so again)"; exit 1; fi
 	@echo
 	
 	@echo "======== Running ================================================"
