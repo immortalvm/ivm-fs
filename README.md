@@ -1,8 +1,6 @@
  This static filesystem generator allows to recreate a read/write folderless 
  static filesystem for testing the ivm64 ecosystem.
 
- **It is required at least compiler version ivm64-gcc 1.0rc5**.
- 
  By invoking the script with the list of files to include in the filesystem,
  it will print to stdout a C code with the file contents and some primitives
  (open, read, lseek, ...) to access the files:

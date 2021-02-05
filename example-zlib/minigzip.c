@@ -562,6 +562,7 @@ int main(argc, argv)
     gzFile file;
     char *bname, outmode[20];
 
+printf("* usage: %s -c -d file.gz\n", argv[0]);
 
 #if !defined(NO_snprintf) && !defined(NO_vsnprintf)
     snprintf(outmode, sizeof(outmode), "%s", "wb6 ");
@@ -582,6 +583,7 @@ int main(argc, argv)
     else if (!strcmp(bname, "zcat"))
       copyout = uncompr = 1;
 
+
     while (argc > 0) {
       if (strcmp(*argv, "-c") == 0)
         copyout = 1;
@@ -599,7 +601,9 @@ int main(argc, argv)
       else
         break;
       argc--, argv++;
+
     }
+    
     if (outmode[3] == ' ')
         outmode[3] = 0;
     if (argc == 0) {
@@ -648,5 +652,6 @@ int main(argc, argv)
             }
         } while (argv++, --argc);
     }
+puts("");
     return 0;
 }

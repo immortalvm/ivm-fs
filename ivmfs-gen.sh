@@ -451,21 +451,14 @@ off_t lseek (fid_t file, off_t offset, int whence)
 }
 
 
-__attribute__((optimize("O0")))
-__attribute__((noinline, noclone))
-static int _IVM64_putchar(int arg)
-{
-    unsigned char ascii = arg;
-    int retval = ascii;
 
-    #ifdef __ivm64__
-        asm volatile ("load1! %0\n": "=m" (ascii));
-        asm volatile ("put_char");
-    #else
-        retval = putchar(arg);
-    #endif
-    return retval;
-}
+#define ivm64_outbyte_const(c) ({asm volatile ("put_char! %0": : "i" (c));})
+#define ivm64_outbyte_var(c)   ({asm volatile ("load1! %0\n\tput_char": :"rm" (c));})
+
+#define ivm64_outbyte(c)     \
+  (__builtin_constant_p(c)	 \
+    ? ivm64_outbyte_const(c) \
+    : ivm64_outbyte_var(c))
 
 ssize_t write(fid_t fid, const void *vptr, size_t nbytes)
 {
@@ -479,7 +472,7 @@ ssize_t write(fid_t fid, const void *vptr, size_t nbytes)
     {
         for (cont=0; cont<nbytes; cont++){
              c = ptr[cont];
-             _IVM64_putchar(c);
+             ivm64_outbyte(c);
         }
         return cont;
     } else {
