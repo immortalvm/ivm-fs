@@ -106,6 +106,12 @@ typedef int fid_t;
 
 static fid_t ofiles = FIRST_FILENO; //ever opened files
 
+int open(const char *name, int flags, ...);
+int close(fid_t fid);
+ssize_t read(fid_t fid, void *vbuf, size_t len);
+ssize_t write(fid_t fid, const void *vptr, size_t nbytes);
+off_t lseek(fid_t file, off_t offset, int whence);
+
 typedef struct {
     char* name;
     unsigned long size;
@@ -436,14 +442,13 @@ off_t lseek (fid_t file, off_t offset, int whence)
                 newpos = offset;
                 break;
         }
+        filesystem[idx].pos = newpos;
         if (newpos > filesystem[idx].size){
-            // This implementation does not allow file resizing
-            errno = EINVAL;
-            return (off_t) -1;
-        } else {
-            filesystem[idx].pos = newpos;
-            return newpos;
+            // Do resizing by writting in the new position 
+            char *ptr = "";
+            write(file, ptr, 0);
         }
+        return newpos;
     } else {
         errno = EBADF;
         return  (off_t) -1;
