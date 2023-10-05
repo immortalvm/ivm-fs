@@ -15,6 +15,11 @@
 # considered part of the name (i.e. if you use "ivmfs-gen.sh /path/to/file"
 # you need to open it as 'open("/path/to/file"...)'
 #
+# Note that files or directories are added individually to the filesystem and,
+# therefore, to add a folder recursively you may wish to do:
+#
+#     ivmfs-gen.sh $(find folder_name) ... > ivmfs.c
+#
 # Then you can link a program with the generated C file, so that the primitives
 # included in it will replace those of newlib, therefore enabling to access the
 # files in a stardard way:
@@ -113,10 +118,10 @@ char* strdup (const char* s);
 #define IVMFS_FIRST_INO() 1000
 
 // The default initial current directory
-#define IVMFSROOT "/work/"
+#define IVMFSROOT "/work"
 
 // This file will emulate STDIN
-#define STDIN_FILE IVMFSROOT"stdin"
+#define STDIN_FILE IVMFSROOT"/stdin"
 
 // When the file grows a multiple of this is allocated
 #define BLKSIZE 64
@@ -130,6 +135,20 @@ char* strdup (const char* s);
 
 #ifdef IVMFS_DUMPFILECONTENTS
 #define IVMFS_DUMPFILES
+#endif
+
+// Define this to include special symbols . and .. in directory listings
+#define IVMFS_GETDENTS_RETURNS_DOT_DIRS
+
+
+// See newlib/libc/include/sys/_default_fcntl.h
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH          16
+#endif
+
+// Linux specific flag
+#ifndef O_TMPFILE
+#define O_TMPFILE   0x800000
 #endif
 
 // Declare fid_t as int to be coherent with unistd.h declarations
@@ -167,16 +186,20 @@ static int rename0(const char *oldpath, const char *newpath);
 static int renameat0(int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
 static long getdents0(unsigned int fd, struct dirent *dirp, unsigned int count);
 static void _seekdir0(DIR *dirp, long loc);
-ssize_t readlink0(const char *pathname, char *buf, size_t bufsiz);
-ssize_t readlinkat0(int dirfd, const char *pathname, char *buf, size_t bufsiz);
-int dup0(int oldfd);
-int dup2_0(int oldfd, int newfd);
+static ssize_t readlink0(const char *pathname, char *buf, size_t bufsiz);
+static ssize_t readlinkat0(int dirfd, const char *pathname, char *buf, size_t bufsiz);
+static int dup0(int oldfd);
+static int dup2_0(int oldfd, int newfd);
+static int symlink0(const char *target, const char *linkpath);
+static int symlinkat0(const char *target, int newdirfd, const char *linkpath);
+static char *realpath0(const char * __restrict path, char * __restrict resolved_path);
+static int isatty0(int fd);
 
 // Prototypes of static 'internal' functions
 static long find_open_file(fid_t fid);
 static long find_file(char* name);
 //- static fid_t get_stdin_fileno(void);
-static int internal_stat(long idx, struct stat *st);
+static int file_stat(long idx, struct stat *st);
 static long create_new_file(const char *name, int flags);
 static long delete_file(long idx);
 static long find_dir(char* name);
@@ -186,8 +209,8 @@ static void init_devices();
 static void check_cwd();
 static int resolve_path_internal(char *path,char *result,char *pos, int nocheck);
 static char *realpath_nocheck(const char *path,char *resolved_path);
+static char *realparentpath(const char *path, char *resolved_path);
 
-char *realpath(const char * __restrict path, char * __restrict resolved_path);
 char *dirname(char *path);
 char *basename(char *path);
 
@@ -195,6 +218,9 @@ char *basename(char *path);
 static unsigned long dump_file_content(char *name);
 static void dump_all_files(void);
 #endif
+static void close_all();
+
+typedef enum filetype_e {IVMFS_REG=0, IVMFS_DIR=1, IVMFS_LNK=2} filetype_t;
 
 typedef struct {
     char* name;
@@ -203,16 +229,20 @@ typedef struct {
     int flags; // open() flags
     // If allocated == 0, the file has not been written
     unsigned long allocated;
-    int isdir; // it's a directory
+    filetype_t type; // it's a directory
     int nameallocated; // the file has been renamed (allocating the new string)
 } file_t;
+
+#define IVMFS_ISREG(a) ((a) == IVMFS_REG)
+#define IVMFS_ISDIR(a) ((a) == IVMFS_DIR)
+#define IVMFS_ISLNK(a) ((a) == IVMFS_LNK)
 
 typedef enum devtype_e {DEVDISK = 0, DEVSTDIN, DEVSTDOUT, DEVSTDERR} devtype_t;
 
 typedef struct {
-    int  open;  // Is an open file or device? (0=free descriptor, 1=open(used))
-    long idx;   // If it is an disk file, the index to which file in the file table
-    unsigned long pos;
+    int  open;   // Is an open file or device? (0=free descriptor, 1=open(used))
+    long idx;    // If it is an disk file, the index to which file in the file table
+    long *pos_p; // File position is stored in this pointer, to be shared when calling dup()
     int flags;
     devtype_t dev; //0=disk file; 1=stdin; 2=stdout; 3=stder
 } openfile_t;
@@ -249,14 +279,18 @@ print_files() {
     nf=0
     nd=0
 
-    # Add always '/' and IVMFSROOT
+    # Add always '/', '/tmp', and IVMFSROOT
     seenfile["/"]=1
-    dir_entry[$nd]='{(char*)"/", 0, (char**)0, 0, 0, 1, 0}'
+    dir_entry[$nd]='{(char*)"/", 0, (char**)0, 0, 0, IVMFS_DIR, 0}'
+    let nd=nd+1
+    #
+    seenfile["/tmp"]=1
+    dir_entry[$nd]='{(char*)"/tmp", 0, (char**)0, 0, 0, IVMFS_DIR, 0}'
     let nd=nd+1
     #
     #do no mark IVMFSROOT as seen, because it is not a true directory,
     #it corresponds to "." and it is defined in the C file
-    dir_entry[$nd]='{(char*)IVMFSROOT, 0, (char**)0, 0, 0, 1, 0}'
+    dir_entry[$nd]='{(char*)IVMFSROOT, 0, (char**)0, 0, 0, IVMFS_DIR, 0}'
     let nd=nd+1
 
     while test $# -gt 0
@@ -264,7 +298,7 @@ print_files() {
         #1>&2 echo "** #=$# @=$@"
 
         filename=''
-        filetype=0
+        filetype=''
         size=0
         sep=
         # Only include existing regular files whose name is not an empty string
@@ -272,7 +306,7 @@ print_files() {
         then
             # REGULAR FILES
             size=$(wc -c < "$1")
-            filetype=0 # 0=regular file
+            filetype=IVMFS_REG # 0=regular file
             sep=
             data="&file${nf}"
 
@@ -280,8 +314,9 @@ print_files() {
         then
             # DIRECTORIES
             size=0
-            filetype=1 # 1=directory
-            sep='/'    # in this fs, directory names are ended by '/'
+            filetype=IVMFS_DIR # 1=directory
+            #sep='/'    # in this fs, directory names are ended by '/'
+            sep=''    # now directory names are NOT ended by '/'
             test "$1" == '/' && sep='' # but do not add '/' to the root directory
             data=0
         else
@@ -299,7 +334,7 @@ print_files() {
             rpath="$(realpath --relative-to=. "$1")"
             if [[ "$rpath" =~ ^[^.] ]] ; then
                 #Filename relative to .
-                ivmfsroot=IVMFSROOT
+                ivmfsroot=IVMFSROOT\"/\"
                 filename="$rpath"
             else
                 #Filename not relative to ., absolutize it
@@ -317,7 +352,7 @@ print_files() {
         # Create the data for regular files
         # For each file print a c statement like this;
         #   static char *file0 = (char[]){72, 101, 108, 108, 111};
-        if test $filetype -eq 0 ; then
+        if test "$filetype" == IVMFS_REG ; then
             if test $PACK -eq 4; then
                 echo "static uint32_t *file${nf} = (uint32_t[]){$(hdf "$1")};" | sed 's/, *}/}/g'
             elif test $PACK -eq 8; then
@@ -330,16 +365,16 @@ print_files() {
         # Create the file/directory entry
         # For each file, generate a statement initializing the
         # file descriptor of type file_t:
-        #   // filename, filesize, (double) pointer to data, position, flags, allocated
+        #   // filename, filesize, (double) pointer to data, flags, allocated, type, nameallocated
         #   {"filename.txt", 6, &file0, 0, 0, 0, 0}
         #file_entry[$n]='{(char*)'$ivmfsroot'"'$filename$sep'"'", $size, (char**)$data, 0, 0, $filetype, 0}"
 
         entry='{(char*)'$ivmfsroot'"'$filename$sep'"'", $size, (char**)$data, 0, 0, $filetype, 0}"
-        if test "$filetype" == 0 ; then
+        if test "$filetype" == IVMFS_REG ; then
             # regular file
             file_entry[$nf]=$entry
             let nf=nf+1
-        elif test "$filetype" == 1 ; then
+        elif test "$filetype" == IVMFS_DIR ; then
             # directory
             dir_entry[$nd]=$entry
             let nd=nd+1
@@ -395,11 +430,13 @@ EEOOFF
     echo '{'
     # First, print directories
     for d in ${!dir_entry[@]}
+    #~ for ((d=0; d<$nd; d++))
     do
         echo '   ' ${dir_entry[$d]}','
     done
     # Next, print regular files
     for f in ${!file_entry[@]}
+    #~ for ((f=0; f<$nf; f++))
     do
         echo '   ' ${file_entry[$f]}','
     done
@@ -420,6 +457,9 @@ typedef struct {
     openfile_t *openfile;
     fid_t stdin_fid;
     char *cwd;
+
+    long spawn_level;
+    int close_all_done;
 } file_data_t;
 
 typedef struct {
@@ -458,6 +498,10 @@ typedef struct {
     ssize_t (*readlinkat)(int dirfd, const char *pathname, char *buf, size_t bufsiz);
     int (*dup)(int oldfd);
     int (*dup2)(int oldfd, int newfd);
+    int (*symlink)(const char *oldpath, const char *newpath);
+    int (*symlinkat)(const char *target, int newdirfd, const char *linkpath);
+    char* (*realpath)(const char * __restrict path, char * __restrict resolved_path);
+    int (*isatty)(int fd);
 } file_oper_t;
 
 typedef struct {
@@ -502,6 +546,10 @@ static filesystem_t filesystem0 = {
         readlinkat: readlinkat0,
         dup: dup0,
         dup2: dup2_0,
+        symlink: symlink0,
+        symlinkat: symlinkat0,
+        realpath: realpath0,
+        isatty: isatty0,
     },
     {
         openfile_size: 0,
@@ -512,6 +560,8 @@ static filesystem_t filesystem0 = {
         openfile: NULL,
         stdin_fid: -2,
         cwd: (char*)IVMFSROOT,
+        spawn_level: 0,
+        close_all_done: 0,
     },
 };
 
@@ -524,29 +574,54 @@ print_functions() {
 cat << EEOOFF
 
 __attribute__((constructor))
-void begin_ivmfs(void) {
+void __IVMFS_start__(void)
+{
     #ifdef IVMFS_DEBUG
     printf("[%s] IVMFS begins ...\n", __func__);
     #endif
 
-    init_devices();
-    check_cwd();
+    void *newfs = NULL;
+    char *newFSstr = getenv("IVM_CRT0_FILESYSTEM");
+    if (newFSstr) {
+
+        newfs = (void*)(unsigned long)strtol(newFSstr, NULL, 16);
+    }
+    if (newfs) {
+
+        fflush(stdout);
+        fflush(stderr);
+        filesystem = (filesystem_t*) newfs;
+        filesystem->data.spawn_level++;
+    }
+    else {
+
+        filesystem->data.spawn_level = 0;
+
+        init_devices();
+
+        check_cwd();
+
+        char fsno[64];
+        snprintf(fsno, 64, "%#lx", (unsigned long)filesystem);
+        setenv("IVM_CRT0_FILESYSTEM", fsno, 1);
+    }
+
+    filesystem->data.close_all_done = 0;
+    atexit(close_all);
+
+    #ifdef IVMFS_DUMPFILES
+    atexit(dump_all_files);
+    #endif
 }
 
-void * get_fs()
+__attribute__((destructor))
+void __IVMFS_end__(void)
 {
-#ifdef IVMFS_DEBUG
-    printf("[%s] -> [%p]\n", __func__, filesystem);
-#endif
-    return (void*)filesystem;
-}
-
-void set_fs(void* fs)
-{
-#ifdef IVMFS_DEBUG
-    printf("[%s] -> [%p]\n", __func__, fs);
-#endif
-    filesystem = (filesystem_t*)fs;
+    #ifdef IVMFS_DEBUG
+    printf("[%s] IVMFS ends ...\n", __func__);
+    #endif
+    filesystem->data.spawn_level = MAX(0,filesystem->data.spawn_level-1);
+    filesystem->data.close_all_done = 0;
 }
 
 int open(const char *name, int flags, ...)
@@ -735,30 +810,145 @@ int dup2(int oldfd, int newfd)
     return filesystem->oper.dup2(oldfd, newfd);
 }
 
-#ifdef __ivm64__
-    static char ivm64_getbyte()
-    {
-        static unsigned long res;
-        asm volatile("read_char\n\t"
-                     "store8! %0":"=m"(res));
-        return (unsigned char)res;
-    }
-    #define ivm64_outbyte_const(c) ({asm volatile ("put_char! %0": : "i" (c));})
-    #define ivm64_outbyte_var(c)   ({asm volatile ("load1! %0\n\tput_char": :"rm" (c));})
-    #define ivm64_outbyte(c)       (__builtin_constant_p(c)?ivm64_outbyte_const(c):ivm64_outbyte_var(c))
+int symlink(const char *target, const char *linkpath)
+{
+    return filesystem->oper.symlink(target, linkpath);
+}
 
-    #define read_char ivm64_getbyte
-    #define put_char ivm64_outbyte
-#else
-    #define read_char getchar
-    #define put_char putchar
+int symlinkat(const char *target, int newdirfd, const char *linkpath)
+{
+    return filesystem->oper.symlinkat(target, newdirfd, linkpath);
+}
+
+char* realpath(const char * __restrict path, char * __restrict resolved_path)
+{
+    return filesystem->oper.realpath(path, resolved_path);
+}
+
+int isatty(int fd)
+{
+    return filesystem->oper.isatty(fd);
+}
+
+static char ivm64_getbyte()
+{
+    static unsigned long res;
+    asm volatile("read_char\n\t"
+                 "store8! %0":"=m"(res));
+    return (unsigned char)res;
+}
+#define ivm64_outbyte_const(c) ({asm volatile ("put_char! %0": : "i" (c));})
+#define ivm64_outbyte_var(c)   ({asm volatile ("load1! %0\n\tput_char": :"rm" (c));})
+#define ivm64_outbyte(c)       (__builtin_constant_p(c)?ivm64_outbyte_const(c):ivm64_outbyte_var(c))
+
+#define read_char ivm64_getbyte
+#define put_char  ivm64_outbyte
+
+static uint8_t read_utf8char() {
+    static uint32_t c;
+    static uint8_t buff[4];
+    static int count=0, pos=0;
+
+    if (pos == count) {
+
+        asm volatile("read_char\n\t"
+                     "store4! %0":"=m"(c));
+
+        count = 0;
+        pos = 0;
+        buff[0]=0; buff[1]=0; buff[2]=0; buff[3]=0;
+
+        if (c < 0x80) {
+            buff[count++] = (uint8_t) c;
+        } else if (c < 0x800) {
+            buff[count++] = (uint8_t) (0xc0 | c >> 6);
+            buff[count++] = (uint8_t) (0x80 | (0x3f & c));
+        } else if (c < 0x10000) {
+            buff[count++] = (uint8_t) (0xe0 | c >> 12);
+            buff[count++] = (uint8_t) (0x80 | (0x3f & c >> 6));
+            buff[count++] = (uint8_t) (0x80 | (0x3f & c));
+        } else {
+            buff[count++] = (uint8_t) (0xf0 | (0x07 & c >> 18));
+            buff[count++] = (uint8_t) (0x80 | (0x3f & c >> 12));
+            buff[count++] = (uint8_t) (0x80 | (0x3f & c >> 6));
+            buff[count++] = (uint8_t) (0x80 | (0x3f & c));
+        }
+    }
+
+    return buff[pos++];
+}
+
+static void put_utf8char(uint8_t c) {
+    static int c0, c1, c2, c3;
+    static uint32_t u0, u1, u2, u3;
+    static int pos=0;
+    uint32_t ret = 0;
+
+    if (pos == 0) {
+        pos++;
+        c0 = c;
+        u0 = (uint32_t)c0;
+        if (c0 < 0x80){
+            ret = u0;
+            goto to_console;
+        }
+        u0 &= 0x1f;
+        return;
+    }
+    else if (pos == 1) {
+        pos++;
+        c1 = c;
+        u1 = (uint32_t)(c1 & 0x3f);
+        if (c0 < 0xe0) {
+            ret = (u0 << 6) + u1;
+            goto to_console;
+        }
+        return;
+    }
+    else if (pos == 2) {
+        pos++;
+        c2 = c;
+        u2 = (uint32_t)(c2 & 0x3f);
+        if (c0 < 0xf0) {
+            ret = (u0 << 12) + (u1 << 6) + u2;
+            goto to_console;
+        }
+        return;
+    }
+    else {
+        c3 = c;
+        u3 = (uint32_t)(c3 & 0x3f);
+        ret = (u0 << 18) + (u1 << 12) + (u2 << 6) + u3;
+    }
+
+    to_console:
+
+        asm volatile ("load4! %0\n\tput_char": :"rm" (ret));
+        pos = 0;
+        return;
+}
+
+#if 1
+#ifdef put_char
+    #undef put_char
+    #define put_char  put_utf8char
+#endif
+#ifdef read_char
+    #undef read_char
+    #define read_char read_utf8char
+#endif
 #endif
 
-#define RLIMIT_NOFILE 1024
+#define RLIMIT_NOFILE 64*1024
 static openfile_t* reallocate_openfile(fid_t fid)
 {
     ssize_t oldsize = filesystem->data.openfile_size;
     ssize_t newsize = MIN(fid*2 + 1, RLIMIT_NOFILE);
+
+    #ifdef IVMFS_DEBUG
+        printk("[%s] oldsize=%ld, newsize=%ld\n", __func__, oldsize, newsize);
+    #endif
+
     openfile_t *newof = (openfile_t*)realloc(filesystem->data.openfile, newsize*sizeof(openfile_t));
     if (newof) {
         memset(&newof[oldsize], 0, (newsize-oldsize)*sizeof(openfile_t));
@@ -786,12 +976,26 @@ static fid_t openfile_entry(long idx)
         }
     }
     if (fid >= 0) {
-        filesystem->data.openfile[fid] = (openfile_t){1, idx, 0, 0, 0};
+        openfile_t *of = &filesystem->data.openfile[fid];
+        of->open = 1;
+        of->idx = idx;
+        of->flags = 0;
+        of->dev = DEVDISK;
+
+        of->pos_p = (long*)malloc(sizeof(long));
+        *(of->pos_p) = 0;
     }
     #ifdef IVMFS_DEBUG
         fprintf(stderr, "[openfile_entry] idx=%ld, fid=%d\n", idx, fid);
     #endif
     return fid;
+}
+
+static int is_valid_fileno(fid_t fid)
+{
+    return (fid >=0
+            && fid < filesystem->data.openfile_size
+            && filesystem->data.openfile[fid].open);
 }
 
 static long find_open_file(fid_t fid)
@@ -808,30 +1012,78 @@ static long find_open_file(fid_t fid)
         }
     }
     #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[find_open_file] fid=%d, idx=%ld\n", fid, idx);
+        fprintf(stderr, "[find_open_file] fid=%d, idx=%ld", fid, idx);
+        if (idx>=0){
+            fprintf(stderr, " pos=%ld size=%ld", *filesystem->data.openfile[fid].pos_p, filesystem->data.filetable[idx].size);
+        }
+        fprintf(stderr, "\n");
     #endif
     return idx;
 }
 
+static void free_pos_pointer(fid_t fid){
+    if (!is_valid_fileno(fid)){
+        return;
+    }
+    long *pos_p = filesystem->data.openfile[fid].pos_p;
+    int reused = 0;
+    for (long k = 0; k < filesystem->data.openfile_size; k++) {
+        if ( k != fid
+             && filesystem->data.openfile[k].open
+             && filesystem->data.openfile[k].pos_p == pos_p)
+        {
+            reused = 1;
+            break;
+        }
+    }
+    if (!reused && pos_p){
+        free(pos_p);
+        filesystem->data.openfile[fid].pos_p = NULL;
+    }
+}
+
 static long remove_open_file(fid_t fid)
 {
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr, "[%s] fid=%d\n", __func__, fid);
+    #endif
+
+    if (!is_valid_fileno(fid)){
+        return -1;
+    }
     long idx = -1;
     if (DEVDISK == filesystem->data.openfile[fid].dev){
 
         idx = find_open_file(fid);
-        if (idx >= 0)
-            filesystem->data.openfile[fid] = (openfile_t){0, 0, 0, 0, 0};
+        if (idx >= 0){
+            free_pos_pointer(fid);
+            filesystem->data.openfile[fid] = (openfile_t){0, 0, 0, 0, DEVDISK};
+        }
     }
     return idx;
 }
 
 static long remove_open_device(fid_t fid)
 {
+    if (filesystem->data.spawn_level > 0
+        && filesystem->data.close_all_done) {
+
+        return 0;
+    }
+
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr, "[%s] fid=%d\n", __func__, fid);
+    #endif
+
+    if (!is_valid_fileno(fid)){
+        return -1;
+    }
+
     long err = -1;
     if (DEVDISK != filesystem->data.openfile[fid].dev){
         if (filesystem->data.openfile[fid].open){
 
-            filesystem->data.openfile[fid] = (openfile_t){0, 0, 0, 0, 0};
+            filesystem->data.openfile[fid] = (openfile_t){0, 0, 0, 0, DEVDISK};
             err = 0;
         }
     }
@@ -842,8 +1094,9 @@ static void open_device(int fd) {
     if (filesystem->data.openfile_size < FIRST_FILENO) {
          reallocate_openfile(FIRST_FILENO);
     }
+    static long pos = 0;
 
-    openfile_t newopenfile = (openfile_t){1, -1, 0, 0, 0};
+    openfile_t newopenfile = (openfile_t){1, -1, &pos, 0, DEVSTDIN};
 
     switch (fd) {
         case STDIN_FILENO:
@@ -882,7 +1135,8 @@ static fid_t find_fileno(long idx)
     fid_t fid = (fid_t)(-1);
     long eidx = idx;
     for (fid_t ifid = 0; ifid < filesystem->data.openfile_size; ifid++) {
-        if (filesystem->data.openfile[ifid].idx == eidx){
+        if (filesystem->data.openfile[ifid].open
+            && filesystem->data.openfile[ifid].idx == eidx){
             fid = ifid;
             break;
         }
@@ -893,8 +1147,108 @@ static fid_t find_fileno(long idx)
     return fid;
 }
 
-#define get_position(FID) (filesystem->data.openfile[FID].pos)
-#define set_position(FID,POS) do{filesystem->data.openfile[FID].pos=(POS);}while(0)
+static void close_all()
+{
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr, "[close_all]");
+    #endif
+
+    filesystem->data.close_all_done = 1;
+    if (filesystem->data.spawn_level > 0) {
+         return;
+    }
+
+    for (int fid = FIRST_FILENO; fid < filesystem->data.openfile_size; fid++) {
+        if (filesystem->data.openfile[fid].open) {
+            #ifdef IVMFS_DEBUG
+            fprintf(stderr, "[%s] closing fid=%ld\n", __func__, fid);
+            #endif
+            close(fid);
+        }
+    }
+}
+
+#define get_position(FID) (*(filesystem->data.openfile[FID].pos_p))
+#define set_position(FID,POS) do{*(filesystem->data.openfile[FID].pos_p)=(POS);}while(0)
+
+static char *add_slash(char *buff, char *name){
+    unsigned long l = strnlen(name, PATH_MAX+1);
+    if (((l == (PATH_MAX-1)) && (name[l-2]!='/')) || (l >= PATH_MAX)){
+        return NULL;
+    }
+    strcpy(buff, name);
+    if (buff[0] && buff[l-1] != '/') {
+        buff[l] = '/';
+        buff[l+1] = '\0';
+    }
+    return buff;
+}
+
+static int has_trail(char *path){
+    if (!*path) return 0;
+    unsigned long l = strlen(path);
+    if (l>1 && '/' == path[l-1]) return 1;
+    if (l>2 && '/' == path[l-2] && '.' == path[l-1]) return 1;
+    if (l>3 && '/' == path[l-3] && '.' == path[l-2] && '.' == path[l-1]) return 1;
+    return 0;
+}
+
+static char *remove_trail2(char *path, char *path_copy, char *trail){
+    long l = strnlen(path, PATH_MAX);
+    strcpy(path_copy, path);
+    if (!path_copy) return NULL;
+    char *p = &path_copy[l-1];
+    char *p0 = &path_copy[0];
+    char trail_draft[PATH_MAX]; trail_draft[PATH_MAX-1]='\0';
+    char *t= &trail_draft[PATH_MAX-2];
+    while (p && p >= p0){
+        if ((p-p0)>0 && '/' == *p) {
+           *t=*p; t--;
+           *p = '\0'; p--;
+        }
+        else if ((p-p0)>1 && '/' == *(p-1) && '.' == *p) {
+            *(t-1)='/'; *t='.'; t-=2;
+            *(p-1) = '\0'; p-=2;
+        }
+        else if ((p-p0)>2 && '/' == *(p-2) && '.' == *(p-1) && '.' == *p) {
+            *(t-2)= '/' ; *(t-1)='.'; *t='.'; t-=3;
+            *(p-2) = '\0'; p-=3;
+        }
+        else break;
+    }
+    strcpy(trail, t+1);
+
+    if (*trail) {
+        char dummybuff[PATH_MAX+1], dummyreal[PATH_MAX+1];
+        char *dummystr = (char*)"/_dummy_";
+        strcpy(dummybuff, dummystr);
+        strcat(dummybuff, "/");
+        strcat(dummybuff, trail);
+        char *rl = realpath_nocheck(dummybuff, dummyreal);
+        #ifdef IVMFS_DEBUG
+        fprintf(stderr, "[%s] trail='%s' dummybuff='%s' dummyreal='%s'\n",__func__, trail, dummybuff, rl);
+        #endif
+        if (rl && !strcmp(dummystr, rl)) {
+
+            strcpy(trail, "");
+        }
+    }
+
+    return p0;
+}
+
+static int is_prefix(char *dirname, char* pathname){
+    long ldirname = strlen(dirname);
+    return  !strncmp(dirname, pathname, ldirname)
+            && (1 == ldirname || '/' == pathname[ldirname]);
+}
+
+static int is_prefix_or_equal(char *dirname, char* pathname){
+    long ldirname = strlen(dirname);
+    return  !strncmp(dirname, pathname, ldirname)
+            && (1 == ldirname || '/' == pathname[ldirname]
+                || ('\0' == dirname[ldirname] && '\0' == pathname[ldirname]));
+}
 
 static long find_file(char* name)
 {
@@ -925,7 +1279,8 @@ static long find_file(char* name)
     if (rl) {
         for (idx=0; idx < filesystem->data.nfiles; idx++){
         #ifdef IVMFS_DEBUG_FIND_FILE
-        fprintf(stderr, "[%s] - data.filetable[%ld].name='%s'\n", __func__, idx, filesystem->data.filetable[idx].name);
+        fprintf(stderr, "[%s] - data.filetable[%ld].name='%s' (%ld bytes)\n",
+                        __func__, idx, filesystem->data.filetable[idx].name,  filesystem->data.filetable[idx].size);
         #endif
             if (! strcmp(filesystem->data.filetable[idx].name, rl)) {
                 return idx;
@@ -934,35 +1289,6 @@ static long find_file(char* name)
     }
 
     return -1;
-}
-
-static void close_all()
-{
-    #ifdef IVMFS_DEBUG
-    fprintf(stderr, "[close_all]");
-    #endif
-    for (int fid = FIRST_FILENO; fid < filesystem->data.openfile_size; fid++) {
-        long idx = filesystem->data.openfile[fid].idx;
-        if (idx > 0) {
-            #ifdef IVMFS_DEBUG
-            fprintf(stderr, "[%s] closing fid=%ld\n", __func__, fid);
-            #endif
-            close(fid);
-        }
-    }
-}
-
-static char *add_slash(char *buff, char *name){
-    unsigned long l = strnlen(name, PATH_MAX+1);
-    if (((l == (PATH_MAX-1)) && (name[l-2]!='/')) || (l >= PATH_MAX)){
-        return NULL;
-    }
-    strcpy(buff, name);
-    if (buff[0] && buff[l-1] != '/') {
-        buff[l] = '/';
-        buff[l+1] = '\0';
-    }
-    return buff;
 }
 
 static long find_dir_internal(char* name, int canon)
@@ -985,14 +1311,14 @@ static long find_dir_internal(char* name, int canon)
     fprintf(stderr,"[%s] Finding directory name '%s' (canon=%d)\n", __func__, name, canon);
     #endif
 
-    add_slash(name_slash, name);
+    strcpy(name_slash, name);
 
     #ifdef IVMFS_DEBUG
     fprintf(stderr,"[%s] name='%s' name_slash='%s'\n", __func__, name, name_slash);
     #endif
 
     for (idx=0; idx < filesystem->data.nfiles; idx++){
-        if (filesystem->data.filetable[idx].isdir
+        if (IVMFS_ISDIR(filesystem->data.filetable[idx].type)
             && ! strcmp(filesystem->data.filetable[idx].name, name_slash)) {
             #ifdef IVMFS_DEBUG
             fprintf(stderr,"[%s] precheck - found existing directory '%s' idx=%ld\n", __func__, name_slash, idx);
@@ -1004,7 +1330,6 @@ static long find_dir_internal(char* name, int canon)
     if (canon) {
 
         char *rl = NULL;
-
         if (!canonizing) {
             canonizing = 1;
             char name_canon[PATH_MAX];
@@ -1013,21 +1338,13 @@ static long find_dir_internal(char* name, int canon)
             fprintf(stderr," [%s] realpath('%s') = '%s'\n", __func__, name_slash, rl);
             #endif
             canonizing = 0;
-            if (!rl) {
+            if (rl) {
+                strcpy(name_slash, rl);
+            } else{
 
                 return -1;
             }
-
-            if (rl) {
-
-                if (!add_slash(name_slash, rl)){
-
-                    return -1;
-                }
-            }
-
         }
-
     }
 
     #ifdef IVMFS_DEBUG
@@ -1035,7 +1352,7 @@ static long find_dir_internal(char* name, int canon)
     #endif
 
     for (idx=0; idx < filesystem->data.nfiles; idx++){
-        if (filesystem->data.filetable[idx].isdir
+        if (IVMFS_ISDIR(filesystem->data.filetable[idx].type)
             && ! strcmp(filesystem->data.filetable[idx].name, name_slash)) {
             #ifdef IVMFS_DEBUG
             fprintf(stderr,"[%s] Found existing directory '%s' idx=%ld\n", __func__, name_slash, idx);
@@ -1046,7 +1363,7 @@ static long find_dir_internal(char* name, int canon)
 
     long findprefix = -1;
     for (idx=0; idx < filesystem->data.nfiles; idx++){
-        if (! strncmp(name_slash, filesystem->data.filetable[idx].name, strlen(name_slash))) {
+        if (is_prefix(name_slash, filesystem->data.filetable[idx].name)) {
             #ifdef IVMFS_DEBUG
             fprintf(stderr,"[%s] Regular file '%s' has prefix '%s'\n", __func__,filesystem->data.filetable[idx].name, name_slash);
             #endif
@@ -1097,9 +1414,16 @@ static void dump_all_files(void)
     for (long idx=0; idx<filesystem->data.nfiles; idx++){
         char *name = filesystem->data.filetable[idx].name;
         unsigned long size = filesystem->data.filetable[idx].size;
+        int dir = IVMFS_ISDIR(filesystem->data.filetable[idx].type);
         fprintf(stderr, "\n=======================================\n");
-        fprintf(stderr, "filetable[%ld]: '%s' %ld bytes\n",
-              idx, name, size);
+        if ('*' == name[0])
+            fprintf(stderr, "filetable[%ld]: '%s' [free entry]\n", idx, name);
+        else if ('#' == name[0])
+            fprintf(stderr, "filetable[%ld]: '%s' [deleted, not free yet]\n", idx, name);
+        else if (dir)
+            fprintf(stderr, "filetable[%ld]: '%s' [dir]\n", idx, name);
+        else
+            fprintf(stderr, "filetable[%ld]: '%s' %ld bytes\n", idx, name, size);
         fprintf(stderr, "=======================================\n");
     #ifdef IVMFS_DUMPFILECONTENTS
         unsigned long l=dump_file_content(name);
@@ -1108,8 +1432,14 @@ static void dump_all_files(void)
 }
 #endif
 
-static int pathat(int dirfd, const char *pathname, char *buff, long size){
+static int pathat(int dirfd, const char *pathname, char *buff, long size)
+{
     if (!pathname || !*pathname || !buff){
+        return -1;
+    }
+
+    long lp = strnlen(pathname, PATH_MAX+1);
+    if ( lp > PATH_MAX || lp >= size){
         return -1;
     }
 
@@ -1125,11 +1455,13 @@ static int pathat(int dirfd, const char *pathname, char *buff, long size){
     if (AT_FDCWD != dirfd) {
 
         long idx = find_open_file(dirfd);
-        if (idx < 0)
+        if (idx < 0) {
             return -1;
+        }
         file_t *f = &filesystem->data.filetable[idx];
-        if (!f->isdir)
+        if (!IVMFS_ISDIR(f->type)){
             return -1;
+        }
         strcpy(dirname, f->name);
     } else{
 
@@ -1137,17 +1469,21 @@ static int pathat(int dirfd, const char *pathname, char *buff, long size){
     }
     dirname[PATH_MAX-1] = '\0';
 
-    #define DIR_SEP(dirname) ((char*)(((strlen(dirname) > 0) && ('/' != dirname[strlen(dirname)-1]))?"":"/"))
-    char *sep = DIR_SEP(dirname);
-    snprintf(buff, size, "%s%s%s", dirname, sep, pathname);
+    if (strlen(dirname)+ lp +1 > size) {
+
+        return -1;
+    }
+    snprintf(buff, size, "%s/%s", dirname, pathname);
     buff[size-1] = '\0';
+
     return 0;
 }
 
 static long find_free_filetable_entry() {
     for (long idx=0; idx<filesystem->data.nfiles; idx++){
         #ifdef IVMFS_DEBUG
-            fprintf(stderr, "[%s] file entry idx=%ld -> name'%s'\n", __func__, idx, filesystem->data.filetable[idx].name);
+            fprintf(stderr, "[%s] file entry idx=%ld -> name'%s'\n",
+                            __func__, idx, filesystem->data.filetable[idx].name);
         #endif
         if (!strcmp(filesystem->data.filetable[idx].name, "*")){
             return idx;
@@ -1158,6 +1494,7 @@ static long find_free_filetable_entry() {
 
 static long create_new_file(const char *name, int flags) {
     long idx = -1;
+    errno = 0;
 
     if (!name || !*name || strnlen(name, PATH_MAX+1) > PATH_MAX) {
         return -1;
@@ -1167,6 +1504,13 @@ static long create_new_file(const char *name, int flags) {
     fprintf(stderr, "[%s] new file to be created '%s'\n", __func__, name);
     #endif
 
+    char dn[PATH_MAX+1];
+    strcpy(dn, name);
+    if (find_dir(dirname(dn))< 0) {
+        errno = ENOTDIR;
+        return -1;
+    }
+
     idx = find_free_filetable_entry();
 
     if (idx < 0) {
@@ -1174,9 +1518,9 @@ static long create_new_file(const char *name, int flags) {
              || (!filesystem->data.max_files_allocated && (filesystem->data.nfiles >= MAX_FILES - 1))
              || (filesystem->data.max_files_allocated  && (filesystem->data.nfiles >= filesystem->data.max_files_allocated - 1))
            ){
-#ifdef IVMFS_DEBUG
+            #ifdef IVMFS_DEBUG
             fprintf(stderr, "[%s] number of files exceeded the space allocated\n", __func__);
-#endif
+            #endif
 
             file_t *newfiletable = NULL;
             if (!filesystem->data.max_files_allocated) {
@@ -1184,9 +1528,9 @@ static long create_new_file(const char *name, int flags) {
                 filesystem->data.max_files_allocated = MAX_FILES*2 + 512;
                 newfiletable = (file_t*)malloc(sizeof(file_t)*filesystem->data.max_files_allocated);
                 if (newfiletable) {
-#ifdef IVMFS_DEBUG
+                    #ifdef IVMFS_DEBUG
                     fprintf(stderr, "[%s] copying fs to new table\n", __func__);
-#endif
+                    #endif
 
                     for (unsigned long k=0; k<MAX_FILES; k++){
                         newfiletable[k] = filesystem->data.filetable[k];
@@ -1200,9 +1544,9 @@ static long create_new_file(const char *name, int flags) {
 
             if (!newfiletable) {
 
-#ifdef IVMFS_DEBUG
+                #ifdef IVMFS_DEBUG
                 fprintf(stderr, "[%s] NO RESOURCES for NEW file\n", __func__);
-#endif
+                #endif
                 errno = ENOMEM;
                 return -1;
             } else {
@@ -1219,17 +1563,17 @@ static long create_new_file(const char *name, int flags) {
         filesystem->data.filetable[idx].size = 0;
 
         filesystem->data.filetable[idx].allocated = 0;
-        filesystem->data.filetable[idx].isdir = 0;
+        filesystem->data.filetable[idx].type = IVMFS_REG;
         if (flags & O_DIRECTORY){
-           filesystem->data.filetable[idx].isdir = 1;
+           filesystem->data.filetable[idx].type = IVMFS_DIR;
         }
         #ifdef IVMFS_DEBUG
-            fprintf(stderr, "[%s] NEW file just created: name='%s', flags=0x%x, idx=%ld, isdir=%d\n", __func__, name, flags, idx, filesystem->data.filetable[idx].isdir);
+            fprintf(stderr, "[%s] NEW file just created: name='%s', flags=0x%x, idx=%ld, type=%d allocated=%d\n",
+                             __func__, name, flags, idx,
+                            filesystem->data.filetable[idx].type,
+                            filesystem->data.filetable[idx].allocated);
         #endif
 
-        char fullpath[PATH_MAX+2];
-        volatile char *rl = realpath(name, fullpath);
-        if (!rl) rl=(char*)(-1);
     }
 
     return idx;
@@ -1260,21 +1604,8 @@ static int open0(const char *name, int flags, ...)
 
     */
 
-    static unsigned long do_once = 0;
-    if (! do_once) {
-        do_once = 1ULL;
-        atexit(close_all);
-    }
-
-    #ifdef IVMFS_DUMPFILES
-    static unsigned long registered_dump = 0;
-    if (! registered_dump){
-        registered_dump = 1ULL;
-        atexit(dump_all_files);
-    }
-    #endif
-
     #ifdef IVMFS_DEBUG
+    fprintf(stderr, "\n===============================\n");
     fprintf(stderr, "[%s] name='%s', flags=0x%x\n", __func__, name, flags);
     #endif
 
@@ -1289,9 +1620,32 @@ static int open0(const char *name, int flags, ...)
 
     long idx;
 
+    int is_tmpfile = 0;
+    char tmpname[PATH_MAX];
+    if (flags & O_TMPFILE) {
+        sprintf(tmpname, "/.tmpfile_%d", rand());
+        name = tmpname;
+
+        flags &= ~O_DIRECTORY;
+
+        flags |= O_CREAT | O_TRUNC;
+        is_tmpfile = 1;
+    }
+
     if (flags & O_DIRECTORY) {
+
+        if ((flags & 0x3) != O_RDONLY){
+           errno = EISDIR;
+           return -1;
+        }
+
         if (flags & O_CREAT) {
-            idx = -1;
+
+            if (mkdir(name, 0777)){
+
+                return -1;
+            }
+            return open(name, flags & (~O_CREAT));
         } else {
 
             #ifdef IVMFS_DEBUG
@@ -1304,39 +1658,92 @@ static int open0(const char *name, int flags, ...)
         }
     } else {
 
-        idx = find_dir((char*)name);
+        idx = find_file((char*)name);
+
         #ifdef IVMFS_DEBUG
         fprintf(stderr,"[%s] find_file '%s' returned idx=%ld\n", __func__, name, idx);
         #endif
 
-        if (idx>=0 && (filesystem->data.filetable[idx].isdir)
+        if (idx>=0 && IVMFS_ISDIR(filesystem->data.filetable[idx].type)
                    && !(flags & O_DIRECTORY)) {
             errno = EISDIR;
             return -1;
         }
+    }
 
-        idx = find_file((char*)name);
+    int islink = (idx >= 0) && IVMFS_ISLNK(filesystem->data.filetable[idx].type);
+    if (islink && (flags & O_NOFOLLOW)){
+
+        errno = ELOOP;
+        return -1;
+    }
+
+    if (islink && ((flags & O_EXCL) && (flags & O_CREAT))) {
+
+        errno = EEXIST;
+        return -1;
+    }
+
+    static long trylink = 0;
+    if (!trylink && islink) {
+        char linkname[PATH_MAX];
+        char *rl = realpath(name, linkname);
+        if (rl) {
+            trylink = 1;
+            int fid = open(rl, flags);
+            trylink = 0;
+            if (fid >= 0) {
+
+                return fid;
+            } else {
+
+                return -1;
+            }
+        } else {
+
+            errno = ENOENT;
+            return -1;
+        }
+    }
+
+    static long trylink2 = 0;
+    if (!trylink && !trylink2 && (idx < 0)) {
+
+        char linkname1[PATH_MAX];
+        char *rl1 = realparentpath(name, linkname1);
+        if (rl1) {
+
+                trylink2 = 1;
+                int fid = open(rl1, flags);
+                trylink2 = 0;
+                return fid;
+        }
     }
 
     if (idx >= 0) {
 
-            int fid = openfile_entry(idx);
-            filesystem->data.openfile[fid].flags = flags;
+        if ((flags & O_EXCL) && (flags & O_CREAT)) {
 
-            if (flags & O_TRUNC){
-                filesystem->data.filetable[idx].size = 0;
-            }
+            errno = EEXIST;
+            return -1;
+        }
 
-            if (flags & O_APPEND){
-                set_position(fid,  filesystem->data.filetable[idx].size - 1);
-            }
+        int fid = openfile_entry(idx);
+        filesystem->data.openfile[fid].flags = flags;
 
-            #ifdef IVMFS_DEBUG
-                fprintf(stderr, "[open] OK name=%s, flags=0x%x, fid=%d\n", name, flags, fid);
-            #endif
+        if (flags & O_TRUNC){
+            filesystem->data.filetable[idx].size = 0;
+        }
 
-            return fid;
+        if (flags & O_APPEND){
+            set_position(fid,  filesystem->data.filetable[idx].size);
+        }
 
+        #ifdef IVMFS_DEBUG
+            fprintf(stderr, "[open] OK name=%s, flags=0x%x, fid=%d\n", name, flags, fid);
+        #endif
+
+        return fid;
     }
 
     if (flags & O_CREAT) {
@@ -1346,13 +1753,7 @@ static int open0(const char *name, int flags, ...)
 
         char fullname[PATH_MAX+1], *rl;
         rl = realpath_nocheck(name, fullname);
-
-        char dn[PATH_MAX+1];
-        strncpy(dn, rl, PATH_MAX); dn[PATH_MAX] = '\0';
-        if (file_in_dir(dirname(dn)) >= 0){
-            errno = EEXIST;
-            return -1;
-        }
+        if (!rl) return -1;
 
         #ifdef IVMFS_DEBUG
             fprintf(stderr, "[%s] new file to be created '%s' fullname='%s'\n", __func__, name, rl);
@@ -1364,7 +1765,12 @@ static int open0(const char *name, int flags, ...)
             if (fid >=0) {
 
                 filesystem->data.openfile[fid].flags = flags;
+                if (is_tmpfile) {
+
+                    unlink(name);
+                }
             }
+
             return fid;
         }
     }
@@ -1401,10 +1807,11 @@ int openat0(int dirfd, const char *pathname, int flags, ...)
 static ssize_t read0(fid_t fid, void *vbuf, size_t len)
 {
     #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[read] fid=%d len=%ld\n", fid, len);
+        fprintf(stderr, "\n===============================\n");
+        fprintf(stderr, "[%s] fid=%d len=%ld\n", __func__, fid, len);
     #endif
 
-    if ((fid < 0) || (fid >= filesystem->data.openfile_size)){
+    if (!is_valid_fileno(fid)){
 
         errno = EBADF;
         return 0;
@@ -1416,7 +1823,7 @@ static ssize_t read0(fid_t fid, void *vbuf, size_t len)
         && (DEVSTDIN == filesystem->data.openfile[fid].dev)) {
 
             long i = 0;
-            char ch;
+            unsigned char ch;
             do {
                 ch = read_char();
                 if (ch == SYSTEM_EOF) break;
@@ -1434,34 +1841,46 @@ static ssize_t read0(fid_t fid, void *vbuf, size_t len)
     }
 
     #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[%s] fid=%d, idx=%ld name='%s'\n", __func__, fid, idx,
-(idx>-1)?filesystem->data.filetable[idx].name:"");
+        fprintf(stderr, "[%s] fid=%d, idx=%ld, name='%s'\n", __func__, fid, idx,
+                        (idx>-1)?filesystem->data.filetable[idx].name:"");
     #endif
 
     if ((filesystem->data.openfile[fid].flags & 0x3) == O_WRONLY){
 
+        #ifdef IVMFS_DEBUG
+            fprintf(stderr, "[%s] fid=%d, idx=%ld name='%s' flags=0x%x (flags & 0x3 == O_WRONLY)\n", __func__, fid, idx,
+    (idx>-1)?filesystem->data.filetable[idx].name:"", filesystem->data.openfile[fid].flags);
+        #endif
         errno = EBADF;
         return -1;
     }
 
     long pos = get_position(fid);
-    len = MIN(len, filesystem->data.filetable[idx].size - pos);
-    if (len > 0) {
-        memcpy(buf, *(filesystem->data.filetable[idx].data) + pos, len);
-        set_position(fid, pos+len);
+    long elen = MIN((long)len, (long)filesystem->data.filetable[idx].size - pos);
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr, "[%s] let us read: requested len=%ld, effective len=%ld | idx=%ld pos=%ld, size=%ld\n",
+                    __func__, len, elen, idx, pos, filesystem->data.filetable[idx].size);
+    #endif
+    if (elen > 0 && pos >= 0) {
+        memcpy(buf, *(filesystem->data.filetable[idx].data) + pos, elen);
+        set_position(fid, pos + elen);
+        #ifdef IVMFS_DEBUG
+            fprintf(stderr, "[%s] OK! count=%ld [fid=%d len=%ld newpos=%ld]\n", __func__, elen, fid, len, pos+len);
+        #endif
+        return elen;
     }
 
     #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[read] OK! count=%ld\n", len);
+        fprintf(stderr, "[%s] read failed: count=%ld [fid=%d len=%ld]\n", __func__, elen, fid, len);
     #endif
-
-    return len;
+    return 0;
 }
 
 static int close0(fid_t fid)
 {
     #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[close] fid=%d\n", fid);
+    fprintf(stderr, "\n===============================\n");
+    fprintf(stderr, "[%s] fid=%d\n", __func__, fid);
     #endif
 
     if ((fid < 0) || (fid >=  filesystem->data.openfile_size)){
@@ -1486,6 +1905,9 @@ static int close0(fid_t fid)
 
         if (filesystem->data.filetable[idx].name[0] == '#') {
 
+            #ifdef IVMFS_DEBUG
+            fprintf(stderr, "[%s] deleting file '%s'\n", __func__, filesystem->data.filetable[idx].name);
+            #endif
             delete_file(idx);
         }
     }
@@ -1496,8 +1918,11 @@ static int close0(fid_t fid)
 static off_t lseek0(fid_t fid, off_t offset, int whence)
 {
     #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[lseek] fid=%d, offset=%ld, whence=%d\n", fid, offset, whence);
+        fprintf(stderr, "\n===============================\n");
+        fprintf(stderr, "[%s] fid=%d, offset=%ld, whence=%d\n", __func__, fid, offset, whence);
     #endif
+
+    errno = 0;
 
     if ((fid < 0) || (fid >=  filesystem->data.openfile_size)){
 
@@ -1506,7 +1931,7 @@ static off_t lseek0(fid_t fid, off_t offset, int whence)
     }
 
     long idx;
-    unsigned long newpos;
+    long newpos;
 
     if (filesystem->data.openfile[fid].dev != DEVDISK) {
         return  0;
@@ -1521,20 +1946,28 @@ static off_t lseek0(fid_t fid, off_t offset, int whence)
                 newpos = filesystem->data.filetable[idx].size + offset;
                 break;
             case SEEK_SET:
-            default:
                 newpos = offset;
                 break;
+            default:
+                errno = EINVAL;
+                return  (off_t)(-1);
+                break;
         }
-        set_position(fid, newpos);
-        if (newpos > filesystem->data.filetable[idx].size){
 
-            char *ptr = (char*)"";
-            write(fid, ptr, 0);
+        if (newpos < 0) {
+            #ifdef IVMFS_DEBUG
+            fprintf(stderr, "[%s] new pos=%ld < 0\n", __func__, newpos);
+            #endif
+            errno = EINVAL;
+            return  (off_t)(-1);
         }
+
+        set_position(fid, newpos);
+
         return newpos;
     } else {
         errno = EBADF;
-        return  (off_t) -1;
+        return  (off_t)(-1);
     }
 }
 
@@ -1544,7 +1977,7 @@ static ssize_t write0(fid_t fid, const void *vptr, size_t nbytes)
     char c;
     unsigned long allocated;
 
-    if ((fid < 0) || (fid >=  filesystem->data.openfile_size)){
+    if (!is_valid_fileno(fid)){
 
         errno = EBADF;
         return 0;
@@ -1566,7 +1999,10 @@ static ssize_t write0(fid_t fid, const void *vptr, size_t nbytes)
 
         #ifdef IVMFS_DEBUG
 
-            fprintf(stderr, "[write] fid=%d, nbytes=%ld, pos=%ld\n", fid, nbytes, (idx<0)?-1:get_position(fid));
+            fprintf(stderr, "\n===============================\n");
+            fprintf(stderr, "[%s] fid=%d, nbytes=%ld, pos=%ld allocated=%ld\n",
+                             __func__, fid, nbytes, (idx<0)?-1:get_position(fid),
+                            (idx<0)?-1: filesystem->data.filetable[idx].allocated);
         #endif
 
         if (idx < 0) {
@@ -1589,13 +2025,12 @@ static ssize_t write0(fid_t fid, const void *vptr, size_t nbytes)
 
             if (filesystem->data.filetable[idx].allocated == 0) {
 
-                allocated = BLKSIZE *((nbytes + 1 + filesystem->data.filetable[idx].size)/BLKSIZE + 1 + EXTRABLKS);
-
+                allocated = BLKSIZE *( (MAX(filesystem->data.filetable[idx].size, get_position(fid)) + nbytes +1)/BLKSIZE + 1 + EXTRABLKS);
                 char **p = (char **)malloc(sizeof(char*));
                 *p = (char *)malloc(allocated * sizeof(char));
                 if (!p || !(*p)){
                     #ifdef IVMFS_DEBUG
-                        fprintf(stderr, "[write] not enough space allocating %ld bytes\n", allocated);
+                        fprintf(stderr, "[%s] not enough space allocating %ld bytes\n", __func__, allocated);
                     #endif
                     errno = EBADF;
                     return  -1;
@@ -1605,35 +2040,35 @@ static ssize_t write0(fid_t fid, const void *vptr, size_t nbytes)
                 if (filesystem->data.filetable[idx].size > 0)
                     memcpy(*p, *(filesystem->data.filetable[idx].data), filesystem->data.filetable[idx].size);
 
-                #ifdef IVMFS_DEBUG
-                    fprintf(stderr, "[write] not enough space re-allocating %ld bytes\n", allocated);
-                #endif
                 filesystem->data.filetable[idx].data = p;
 
                 #ifdef IVMFS_DEBUG
-                    fprintf(stderr, "[write] allocated %ld bytes\n", allocated);
+                    fprintf(stderr, "[%s] allocated %ld bytes\n", __func__, allocated);
                 #endif
 
             } else {
 
                 unsigned int finalbyte = get_position(fid) + nbytes - 1;
                 if (finalbyte >= filesystem->data.filetable[idx].allocated) {
-                    allocated = BLKSIZE *((nbytes + 1 + filesystem->data.filetable[idx].allocated)/BLKSIZE + 1 + EXTRABLKS);
-                    char **p = filesystem->data.filetable[idx].data;
-                    *p = (char *)realloc(*(filesystem->data.filetable[idx].data), allocated * sizeof(char));
 
-                    if (!*p){
+                    allocated = BLKSIZE *((finalbyte + 1)/BLKSIZE + 1 + EXTRABLKS);
+                    char **p = filesystem->data.filetable[idx].data;
+                    char *newp = (char *)realloc(*(filesystem->data.filetable[idx].data), allocated * sizeof(char));
+
+                    if (!newp){
                     #ifdef IVMFS_DEBUG
-                        fprintf(stderr, "[write] not enough space re-allocating %ld bytes\n", allocated);
+                        fprintf(stderr, "[%s] error re-allocating %ld bytes %s\n", __func__, allocated, (errno==ENOMEM)?"(ENOMEM)":"");
                     #endif
                         errno = EBADF;
                         return  -1;
                     }
+
+                    *p = newp;
                     filesystem->data.filetable[idx].allocated = allocated;
                     filesystem->data.filetable[idx].data = p;
 
                     #ifdef IVMFS_DEBUG
-                        fprintf(stderr, "[write] re-allocated %ld bytes\n", allocated);
+                        fprintf(stderr, "[%s] re-allocated %ld bytes\n", __func__, allocated);
                     #endif
                 }
             }
@@ -1643,56 +2078,67 @@ static ssize_t write0(fid_t fid, const void *vptr, size_t nbytes)
             }
 
             long pos = get_position(fid);
-            memcpy(*(filesystem->data.filetable[idx].data) + pos, ptr, nbytes);
-            filesystem->data.filetable[idx].size = MAX(filesystem->data.filetable[idx].size, pos + nbytes);
-            set_position(fid, pos+nbytes);
-
-            return nbytes;
+            if (pos >= 0 && nbytes > 0) {
+                memcpy(*(filesystem->data.filetable[idx].data) + pos, ptr, nbytes);
+                filesystem->data.filetable[idx].size = MAX(filesystem->data.filetable[idx].size, pos + nbytes);
+                set_position(fid, pos+nbytes);
+                return nbytes;
+            } else {
+                return 0;
+            }
         }
     }
 }
 
-static int internal_stat(long idx, struct stat *st)
+static int file_stat(long idx, struct stat *st)
 {
     struct stat S;
+
+    memset(&S, 0, sizeof(S));
+
+    file_t *f = &filesystem->data.filetable[idx];
 
     S.st_dev = 1;       /* ID of device containing file */
     S.st_ino = IVMFS_FIRST_INO() + idx; /* Inode number (0 is reserved)*/
     S.st_mode = 0777;   /* File type and mode */
-    if (filesystem->data.filetable[idx].isdir) {
+    if (IVMFS_ISDIR(f->type)) {
 
         S.st_mode |= S_IFDIR;
+    } else if (IVMFS_ISLNK(f->type)) {
+
+        S.st_mode |= S_IFLNK;
     } else {
 
         S.st_mode |= S_IFREG;
     }
+
     S.st_nlink = 1;     /* Number of hard links */
     S.st_uid = 0;       /* User ID of owner */
     S.st_gid = 0;       /* Group ID of owner */
     S.st_rdev = 0;      /* Device ID (if special file) */
-    S.st_size = filesystem->data.filetable[idx].size;   /* Total size, in bytes */
-    S.st_blksize = BLKSIZE;             /* Block size for filesystem I/O */
+    S.st_size = f->size;    /* Total size, in bytes */
+    S.st_blksize = BLKSIZE; /* Block size for filesystem I/O */
     /* Number of 512B blocks allocated */
-    S.st_blocks = (MAX(filesystem->data.filetable[idx].size, filesystem->data.filetable[idx].allocated)+(512-1))/512;
+    S.st_blocks = (MAX(f->size, f->allocated)+(512-1))/512;
 
     *st = S;
     return 0;
 }
 
-static int stat0(const char *file, struct stat *st)
+static int lstat_nocanon(const char *file, struct stat *st)
 {
     long idx;
 
     #ifdef IVMFS_DEBUG
-    fprintf(stderr, "[%s] filename='%s'\n", __func__, file);
+    fprintf(stderr, "[%s] file='%s'\n", __func__, file);
     #endif
 
-    idx = find_dir((char*)file);
+    idx = find_file((char*)file);
     if (idx < 0){
         #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[%s] trying file '%s'\n", __func__, file);
+        fprintf(stderr, "[%s] '%s' not in table, trying find_dir \n", __func__, file);
         #endif
-        idx = find_file((char*)file);
+        idx = find_dir_nocanon((char*)file);
         if (idx < 0) {
             errno = ENOENT;
             return -1;
@@ -1703,24 +2149,104 @@ static int stat0(const char *file, struct stat *st)
     fprintf(stderr, "[%s] found '%s' idx=%ld\n", __func__, file, idx);
     #endif
 
-    return internal_stat(idx, st);
+    return file_stat(idx, st);
+}
+
+static int stat0(const char *file, struct stat *st)
+{
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr, "[%s] file='%s'\n", __func__, file);
+    #endif
+
+    char buff[PATH_MAX];
+    char *rl = realpath(file, buff);
+    if (!rl) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    return lstat_nocanon(buff, st);
+
+}
+
+static int lstat0(const char *file, struct stat *st)
+{
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr, "[%s] file='%s'\n", __func__, file);
+    #endif
+
+    char realparentname[PATH_MAX];
+    char *rl = realparentpath(file, realparentname);
+    if (!rl) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    return lstat_nocanon(realparentname, st);
+}
+
+static int device_stat(int fd, struct stat *st)
+{
+    struct stat S;
+
+    memset(&S, 0, sizeof(S));
+
+    S.st_dev = 2;       /* ID of device containing file */
+
+    if (filesystem->data.openfile[fd].dev == DEVSTDIN) {
+        /* Fake inodes for devices below the first disk inode */
+        S.st_ino = IVMFS_FIRST_INO() - 1;
+        /* Device ID (if special file) */
+        S.st_rdev = DEVSTDIN;
+    }
+    else if (filesystem->data.openfile[fd].dev == DEVSTDOUT) {
+        S.st_ino = IVMFS_FIRST_INO() - 2;
+        S.st_rdev = DEVSTDOUT;
+    }
+    else if (filesystem->data.openfile[fd].dev == DEVSTDERR) {
+        S.st_ino = IVMFS_FIRST_INO() - 3;
+        S.st_rdev = DEVSTDERR;
+    }
+
+    S.st_mode = 0777;     /* File type and mode */
+    S.st_mode |= S_IFCHR; /* stdin, stdout, stderr as char devices */
+
+    S.st_nlink = 1;     /* Number of hard links */
+    S.st_uid = 0;       /* User ID of owner */
+    S.st_gid = 0;       /* Group ID of owner */
+
+    S.st_size = 0;    /* Total size, in bytes */
+    S.st_blksize = BLKSIZE; /* Block size for filesystem I/O */
+    /* Number of 512B blocks allocated */
+    S.st_blocks = 0;
+
+    *st = S;
+    return 0;
 }
 
 static int fstat0(int fid, struct stat *st)
 {
     long idx;
 
+    if (!is_valid_fileno(fid)){
+        errno = EBADF;
+        return -1;
+    }
+
+    if ((DEVSTDIN == filesystem->data.openfile[fid].dev)
+           || (DEVSTDOUT == filesystem->data.openfile[fid].dev)
+           || (DEVSTDERR == filesystem->data.openfile[fid].dev))
+    {
+
+        return device_stat(fid, st);
+    }
+
     if ((idx = find_open_file(fid)) < 0) {
         errno = ENOENT;
         return -1;
     }
 
-    return internal_stat(idx, st);
-}
-
-static int lstat0(const char *pathname, struct stat *st)
-{
-    return stat(pathname, st);
+    return file_stat(idx, st);
 }
 
 static int access0(const char *pathname, int mode)
@@ -1731,25 +2257,39 @@ static int access0(const char *pathname, int mode)
 
 static int faccessat0(int dirfd, const char *pathname, int mode, int flags)
 {
-    char filenamebuff[PATH_MAX];
-    int err = pathat(dirfd, pathname, filenamebuff, PATH_MAX);
-
-    if (!err) {
-        return access(filenamebuff, mode);
-    } else {
-        errno = ENOENT;
-        return -1;
-    }
+    struct stat s;
+    return fstatat(dirfd, pathname, &s, flags);
 }
 
 static int fstatat0(int dirfd, const char *pathname, struct stat *statbuf,
                    int flags)
 {
+
+    if (pathname && !*pathname && (flags && AT_EMPTY_PATH)){
+
+        if (dirfd != AT_FDCWD) {
+            return fstat(dirfd, statbuf);
+        } else {
+            char pwd[PATH_MAX];
+            if (getcwd(pwd, PATH_MAX-1)) {
+                return fstatat(AT_FDCWD, pwd, statbuf, flags);
+            }
+            else {
+                errno = ENOENT;
+                return -1;
+            }
+        }
+    }
+
     char filenamebuff[PATH_MAX];
     int err = pathat(dirfd, pathname, filenamebuff, PATH_MAX);
 
     if (!err) {
-        return stat(filenamebuff, statbuf);
+        if (flags & AT_SYMLINK_NOFOLLOW){
+            return lstat(filenamebuff, statbuf);
+        } else {
+            return stat(filenamebuff, statbuf);
+        }
     } else {
         errno = ENOENT;
         return -1;
@@ -1803,6 +2343,11 @@ char *get_current_dir_name0(void)
 
 static int unlink0(const char *pathname)
 {
+    #ifdef IVMFS_DEBUG
+        fprintf(stderr, "\n===============================\n");
+        fprintf(stderr, "[%s] pathname='%s'\n", __func__, pathname);
+    #endif
+
     if (!pathname || !*pathname ) {
         errno = ENOENT;
         return -1;
@@ -1813,34 +2358,38 @@ static int unlink0(const char *pathname)
         return -1;
     }
 
-    long idx;
+    int sn;
+    struct stat s;
+    sn = lstat(pathname, &s);
 
-    idx = find_dir((char *)pathname);
-    if (idx > 0) {
-
-        errno = EISDIR;
-        return -1;
-    }
-
-    idx = find_file((char *)pathname);
-    if (idx < 0) {
+    if (sn) {
 
         errno = ENOENT;
         return -1;
     } else {
-        file_t *f = &filesystem->data.filetable[idx];
-        if (f->isdir) {
+        if (S_ISDIR(s.st_mode)){
 
             errno = EISDIR;
             return -1;
         } else {
+            long idx = s.st_ino - IVMFS_FIRST_INO();
+            file_t *f = &filesystem->data.filetable[idx];
+            if (IVMFS_ISDIR(f->type)) {
 
-            long nf = delete_file(idx);
-            if (nf < 0) {
-                errno = ENOENT;
+                errno = EISDIR;
                 return -1;
             } else {
-                return 0;
+
+                #ifdef IVMFS_DEBUG
+                    fprintf(stderr, "[%s] deleting a regular file or link idx=%ld (name='%s')\n", __func__, idx, f->name);
+                #endif
+                long nf = delete_file(idx);
+                if (nf < 0) {
+                    errno = ENOENT;
+                    return -1;
+                } else {
+                    return 0;
+                }
             }
         }
     }
@@ -1881,6 +2430,27 @@ static void check_cwd(){
     }
 }
 
+#define IVMFS_DENTRY_IS_DOT(pdirent)  ((pdirent) && (!strcmp(".", (pdirent)->d_name) || !strcmp("..", (pdirent)->d_name)))
+
+static int is_empty_dir(char *dirname){
+    int empty = 0;
+    DIR *dir = opendir(dirname);
+    if(dir){
+
+        empty = 1;
+        struct dirent *pdirent;
+        while ((pdirent = readdir(dir))) {
+            if (pdirent && !IVMFS_DENTRY_IS_DOT(pdirent)) {
+
+                empty = 0;
+                break;
+            }
+        }
+        closedir(dir);
+    }
+    return empty;
+}
+
 static int rmdir0(const char *pathname)
 {
     if (!pathname || !*pathname){
@@ -1888,7 +2458,15 @@ static int rmdir0(const char *pathname)
         return -1;
     }
 
-    long idx = find_dir((char *)pathname);
+    struct stat s;
+    int serr = lstat(pathname, &s);
+    if (serr || ! S_ISDIR(s.st_mode)) {
+
+        errno = ENOTDIR;
+        return -1;
+    }
+
+    long idx = s.st_ino - IVMFS_FIRST_INO();
 
     if (idx >= 0) {
         file_t *d = &filesystem->data.filetable[idx];
@@ -1897,22 +2475,17 @@ static int rmdir0(const char *pathname)
             return 0;
         }
 
-        long nd = 0;
+        long ed = 0;
 
-        if (d->isdir) {
-            DIR *dir = opendir(d->name);
-            if(dir){
-                struct dirent *pdirent;
-                pdirent = readdir(dir);
-                if (pdirent) {nd++;}
-                closedir(dir);
-            }
+        if (IVMFS_ISDIR(d->type)) {
+            ed = is_empty_dir(d->name);
         }
         #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[%s] trying to remove dir '%s' w/ %ld elements\n", __func__, d->name, nd);
+        fprintf(stderr, "[%s] trying to remove dir '%s' (is empty? = %d)\n",
+                         __func__, d->name, ed);
         #endif
 
-        if (nd > 0) {
+        if (!ed) {
             errno = ENOTEMPTY;
             return -1;
         } else {
@@ -1927,6 +2500,16 @@ static int rmdir0(const char *pathname)
     return -1;
 }
 
+static int is_dirname_a_dir(char *fullrealpath){
+    char dn[PATH_MAX];
+    strcpy(dn, fullrealpath);
+    dn[PATH_MAX-1] = '\0';
+    if (find_dir(dirname(dn)) >= 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static long file_in_dir(char *dir) {
     char file_slash[PATH_MAX+1];
     char dir_slash[PATH_MAX+1];
@@ -1938,11 +2521,12 @@ static long file_in_dir(char *dir) {
 
     for (long idx=0; idx < filesystem->data.nfiles; idx++){
         file_t f =  filesystem->data.filetable[idx];
-        if (!f.isdir) {
+        if (! IVMFS_ISDIR(f.type)) {
 
             char *ff = add_slash(file_slash, f.name);
             #ifdef IVMFS_DEBUG
-            fprintf(stderr, "[%s] Checking file is prefix of a dir idx=%ld strncmp(file='%s', dir='%s', len=%ld) = %d\n", __func__, idx, file_slash, dir_slash, strlen(file_slash), strncmp(file_slash, dir_slash, strlen(file_slash)));
+            fprintf(stderr, "[%s] Checking file is prefix of a dir idx=%ld strncmp(file='%s', dir='%s', len=%ld) = %d\n",
+                            __func__, idx, file_slash, dir_slash, strlen(file_slash), strncmp(file_slash, dir_slash, strlen(file_slash)));
             #endif
 
             if (ff && !strncmp(file_slash, dir_slash, strlen(file_slash))){
@@ -1967,39 +2551,20 @@ static int mkdir0(const char *pathname, mode_t mode)
         return -1;
     }
 
-    char fullpath[PATH_MAX+2], *rl;
-    rl = realpath_nocheck(pathname, fullpath);
+    long idx = find_file((char*)pathname);
+    if (idx >= 0){
+        errno = EEXIST;
+        return -1;
+    }
 
-    #ifdef IVMFS_DEBUG
-    printf("[%s] pathname='%s' fullpath='%s'\n", __func__, pathname, rl);
-    #endif
+    int fid = open((char*)pathname, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fid >= 0) {
+        write(fid, "", 0);
 
-    if (rl) {
-
-        long idx1 = find_dir_nocanon(rl);
-        long idx2 = file_in_dir(rl);
-        if (idx1 >= 0 ||  idx2 >= 0) {
-
-            errno = EEXIST;
-            return -1;
-        } else {
-
-            long l = strlen(rl);
-            if (strcmp(rl, "/") &&  rl[l-1] != '/') {
-
-                rl[l] = '/';
-                rl[l+1] = '\0';
-            }
-
-            long idx = create_new_file(rl, O_CREAT | O_DIRECTORY);
-
-            if (idx >= 0) {
-                return 0;
-            } else {
-                errno = ENOMEM;
-                return -1;
-            }
-        }
+        idx = filesystem->data.openfile[fid].idx;
+        close(fid);
+        filesystem->data.filetable[idx].type = IVMFS_DIR;
+        return 0;
     }
 
     errno = ENOENT;
@@ -2044,10 +2609,8 @@ static int chdir0(const char *path)
         printf("[%s] path='%s' ending in '/'\n", __func__, path);
         #endif
     }
-    rl = realpath(path, fullpath);
 
-    if (rl && rl[strlen(rl)-1] != '/')
-    { strcat(rl,"/"); }
+    rl = realpath_nocheck(path, fullpath);
 
     #ifdef IVMFS_DEBUG
     printf("[%s] path='%s' fullpath='%s'\n", __func__, path, rl);
@@ -2065,7 +2628,6 @@ static int chdir0(const char *path)
             } else {
                 cwdallocated = 1;
             }
-
             filesystem->data.cwd = strdup(rl);
             return 0;
         }
@@ -2083,7 +2645,7 @@ static int fchdir0(int dirfd)
         return -1;
     }
     file_t *f = &filesystem->data.filetable[idx];
-    if (!f->isdir){
+    if (! IVMFS_ISDIR(f->type)){
         errno = ENOTDIR;
         return -1;
     }
@@ -2152,288 +2714,348 @@ static long delete_file(long idx){
     return n;
 }
 
-static int rename0_internal(const char *oldpath_a, const char *newpath_a)
+#define rename0_internal_new rename0_internal
+
+static int rename0_internal_new(const char *oldpath_a, const char *newpath_a)
 {
-    char *oldpath = (char*)oldpath_a;
-    char *newpath = (char*)newpath_a;
-    struct stat old_s, new_s, dn_newpath_s;
-    int so, sn, snn;
-    long idx;
-    so = stat(oldpath, &old_s);
-    sn = stat(newpath, &new_s);
+    char *src = (char*)oldpath_a;
+    char *dst = (char*)newpath_a;
 
     #ifdef IVMFS_DEBUG
-    fprintf(stderr, "[%s] rename(oldpath='%s' newpath='%s')\n", __func__, oldpath, newpath);
+    #define IVMFS_DEBUG_RENAME0
     #endif
 
-    char *dn_newpath, dn_newpath_copy[PATH_MAX+1];
-    strncpy(dn_newpath_copy, newpath, PATH_MAX); dn_newpath_copy[PATH_MAX] = '\0';
-    if (strlen(dn_newpath_copy)>=PATH_MAX) {
-        errno = ENAMETOOLONG;
-        return -1;
+    int src_ok = 0;
+    int src_dir = 0;
+
+    struct stat s_src;
+    char realparentsrc[PATH_MAX+1];
+    if (realparentpath(src, realparentsrc)) {
+        src_ok = ! lstat(src, &s_src);
+
+        if (src_ok) src_dir = S_ISDIR(s_src.st_mode);
     }
-    dn_newpath = dirname(dn_newpath_copy);
-    snn = stat(dn_newpath, &dn_newpath_s);
 
-    #ifdef IVMFS_DEBUG
-    fprintf(stderr, "[%s]  newpath='%s' dirname(newpath)='%s' stat(dirname(newpath))=%d\n", __func__, newpath, dn_newpath, snn);
+    #ifdef IVMFS_DEBUG_RENAME0
+    fprintf(stderr, "[%s]  src='%s' (exist? %d) dst='%s'\n", __func__,
+            src, src_ok, dst);
     #endif
 
-    char fullnewpath[PATH_MAX+1], *rl;
-    rl = realpath_nocheck(newpath, fullnewpath);
+    if (!src_ok) {
 
-    if (so) {
-
-        #ifdef IVMFS_DEBUG
-        fprintf(stderr, "[%s]  oldpath '%s' does not exist\n", __func__, oldpath);
+        #ifdef IVMFS_DEBUG_RENAME0
+        fprintf(stderr, "[%s]  source (old) path '%s' does not exist\n",
+                __func__, src);
         #endif
         errno = ENOENT;
         return -1;
+    }
+
+    int dst_ok = 0;
+    int dst_dir = 0;
+
+    struct stat s_dst;
+    dst_ok = ! lstat(dst, &s_dst);
+
+    char realdst[PATH_MAX+1];
+    if (dst_ok && (dst_dir = S_ISDIR(s_dst.st_mode))){
+        (void) realpath(dst, realdst);
     } else {
-        if (old_s.st_mode & S_IFDIR) {
 
-            long idxo = find_dir(oldpath);
-            file_t *od = &filesystem->data.filetable[idxo];
+        char *rl = realparentpath(dst, realdst);
+        if (!rl || !is_dirname_a_dir(rl)){
 
-            long idxn = find_dir(newpath);
-
-            if (idxn >= 0) {
-
-                file_t *nd = &filesystem->data.filetable[idxn];
-
-                #ifdef IVMFS_DEBUG
-                fprintf(stderr, "[%s] od->name='%s' -> nd->name='%s'\n", __func__, od->name, nd->name);
-                #endif
-
-                char fullnewname[PATH_MAX+1], *f_name_copy = strdup(od->name);
-                long n = snprintf(fullnewname, PATH_MAX+1, "%s%s", nd->name, basename(f_name_copy));
-                free(f_name_copy);
-                if (n > PATH_MAX) {
-                    errno = ENAMETOOLONG;
-                    return -1;
-                }
-
-                #ifdef IVMFS_DEBUG
-                fprintf(stderr, "[%s] trying to move '%s' -> fullnewname='%s'\n", __func__, od->name, fullnewname);
-                #endif
-
-                if (find_dir(fullnewname) >= 0){
-                    #ifdef IVMFS_DEBUG
-                    fprintf(stderr, "[%s] fullnewname='%s' already exists\n", __func__, fullnewname);
-                    #endif
-                    errno = EEXIST;
-                    return -1;
-                }
-
-                if (rename(od->name, fullnewname) != -1) {
-                    return 0;
-                }
-
-                errno = ENOTEMPTY;
-                return -1;
-            } else {
-
-                long n;
-                char fullnewname[PATH_MAX+1], fullnewname_slash[PATH_MAX+1];
-                char *rln = realpath_nocheck(newpath, fullnewname);
-
-                if (!rln){
-
-                    errno = EFAULT;
-                    return -1;
-                }
-
-                if (fullnewname[0] && fullnewname[strlen(fullnewname)-1] != '/') {
-                    n = snprintf(fullnewname_slash, PATH_MAX+1, "%s/", fullnewname);
-                } else {
-                    n = snprintf(fullnewname_slash, PATH_MAX+1, "%s", fullnewname);
-                }
-                if (n > PATH_MAX) {
-                    errno = ENAMETOOLONG;
-                    return -1;
-                }
-
-                if (file_in_dir(fullnewname_slash) >= 0){
-
-                    #ifdef IVMFS_DEBUG
-                    fprintf(stderr, "Moving directory to file not allowed \n");
-                    #endif
-                    errno = EEXIST;
-                    return -1;
-                }
-
-                #ifdef IVMFS_DEBUG
-                fprintf(stderr, "[%s] (canonicalized) oldpath='%s' newpath='%s' fullnewname_slash='%s'\n", __func__, od->name, newpath, fullnewname_slash);
-                #endif
-
-                char *oldpath_copy = strdup(od->name);
-
-                for (long idxi=0; idxi < filesystem->data.nfiles; idxi++){
-                    file_t *fn =  &filesystem->data.filetable[idxi];
-                    #ifdef IVMFS_DEBUG
-                    fprintf(stderr,"[%s] Checking if entry '%s' has prefix '%s'?\n", __func__,fn->name, oldpath_copy);
-                    #endif
-                    if (! strncmp(oldpath_copy, fn->name, strlen(oldpath_copy))) {
-                        #ifdef IVMFS_DEBUG
-                        fprintf(stderr,"[%s] Entry '%s' has prefix '%s'\n", __func__,fn->name, oldpath_copy);
-                        #endif
-                        char *entryname =  fn->name;
-                        char buff[PATH_MAX+1];
-
-                        #ifdef IVMFS_DEBUG
-                        fprintf(stderr,"[%s] Concatenating '%s' + '%s' \n", __func__, fullnewname_slash, &entryname[strlen(oldpath_copy)]);
-                        #endif
-                        n = snprintf(buff, PATH_MAX+1, "%s%s", fullnewname_slash, &entryname[strlen(oldpath_copy)]);
-                        if (n > PATH_MAX)
-                        {
-                            errno = ENAMETOOLONG;
-                            return -1;
-                        }
-                        if (!rename_file(fn, buff)) {
-                            errno = ENOENT;
-                            return -1;
-                        }
-                    }
-                }
-                free(oldpath_copy);
-                return 0;
-            }
-
-            errno = ENOENT;
+            errno = ENOTDIR;
             return -1;
-        } else {
-
-            idx = find_file(oldpath);
-            file_t *f = &filesystem->data.filetable[idx];
-            #ifdef IVMFS_DEBUG
-            fprintf(stderr, "[%s] real oldpath='%s' idx='%ld'\n", __func__, f->name, idx);
-            #endif
-            if (!sn){
-
-                long idxn = find_file(newpath);
-
-                #ifdef IVMFS_DEBUG
-                fprintf(stderr, "[%s] newpath '%s' exists idxn=%ld (if it is a file will be overwritten)\n", __func__, newpath, idxn);
-                #endif
-
-                if (idxn >= 0 && idxn == idx) {
-                    #ifdef IVMFS_DEBUG
-                    fprintf(stderr, "[%s] new and old are the same\n", __func__);
-                    #endif
-
-                    return 0;
-                }
-
-                if (S_ISREG(new_s.st_mode) && (idxn >= 0)) {
-
-                    file_t *fn = &filesystem->data.filetable[idxn];
-
-                    #ifdef IVMFS_DEBUG
-                    fprintf(stderr, "[%s] newpath '%s' is a regular file\n", __func__, fn->name);
-                    #endif
-                    if (!fn->isdir){
-
-                        if (!rename_file(f, fn->name)){
-                            errno = ENOENT;
-                            return -1;
-                        }
-
-                        long nf = delete_file(idxn);
-                        if (nf < 0) {
-                            errno = ENOENT;
-                            return -1;
-                        }
-                        return 0;
-                    } else {
-
-                        errno = ENOENT;
-                        return -1;
-                    }
-                } else if (S_ISDIR(new_s.st_mode)) {
-
-                    long idxnd = find_dir(newpath);
-                    if (idxnd < 0) {
-                        errno = ENOTDIR;
-                        return -1;
-                    }
-
-                    file_t *fn = &filesystem->data.filetable[idxnd];
-
-                    char *new_name = strdup(f->name);
-                    char fullnewname[PATH_MAX+1];
-                    long n = snprintf(fullnewname, PATH_MAX+1, "%s%s", fn->name, basename(new_name));
-                    free(new_name);
-                    if (n > PATH_MAX) {
-                        errno = ENAMETOOLONG;
-                        return -1;
-                    }
-
-                    if (0 == rename(f->name, fullnewname)){
-                        return 0;
-                    }
-
-                    errno = ENOENT;
-                    return -1;
-
-                } else {
-                    errno = ENOENT;
-                    return -1;
-                }
-            } else {
-
-                #ifdef IVMFS_DEBUG
-                fprintf(stderr, "[%s] newpath '%s' does NOT exist\n", __func__, newpath);
-                #endif
-
-                char full_dn_newpath[PATH_MAX+1];
-                char *dn_rl = realpath_nocheck(dn_newpath, full_dn_newpath);
-                long idxdn = file_in_dir(dn_rl);
-
-                #ifdef IVMFS_DEBUG
-                fprintf(stderr, "[%s] dirname of newpath='%s' => '%s' found file of which it is prefix idxdn='%ld'\n", __func__, dn_newpath, dn_rl, idxdn);
-                #endif
-                if (idxdn >= 0){
-                     errno = EEXIST;
-                     return -1;
-                }
-
-                if (!snn) {
-                   if (! S_ISDIR(dn_newpath_s.st_mode)){
-                        #ifdef IVMFS_DEBUG
-                        fprintf(stderr, "[%s] dirname of newpath = '%s' is a file\n", __func__, dn_newpath);
-                        #endif
-                        errno = EEXIST;
-                        return -1;
-                   }
-                }
-                if (!rename_file(f, rl)){
-                    #ifdef IVMFS_DEBUG
-                    fprintf(stderr, "[%s] failed '%s' -> '%s'\n", __func__, f->name, rl);
-                    #endif
-                    errno = ENOENT;
-                    return -1;
-                } else {
-                    return 0;
-                }
-            }
         }
     }
 
-    fprintf(stderr, "[%s] unreachable ?\n", __func__);
+    long idx_src = -1;
+    long idx_dst = -1;
+    file_t *f_src=NULL, *f_dst=NULL;
 
-    errno = ENOENT;
-    return -1;
+    if (src_ok)
+        idx_src = s_src.st_ino - IVMFS_FIRST_INO();
+    if (dst_ok)
+        idx_dst = s_dst.st_ino - IVMFS_FIRST_INO();
+
+    if (idx_src >= 0)
+        f_src = &filesystem->data.filetable[idx_src];
+    if (idx_dst >= 0)
+        f_dst = &filesystem->data.filetable[idx_dst];
+
+    if (dst_ok) {
+
+        if (!dst_dir) {
+
+            if (!src_dir) {
+
+                #ifdef IVMFS_DEBUG_RENAME0
+                fprintf(stderr, "[%s] FILE -> FILE \n", __func__);
+                #endif
+
+                if (idx_dst >= 0 && idx_dst == idx_src) {
+                    #ifdef IVMFS_DEBUG_RENAME0
+                    fprintf(stderr, "[%s] new and old are the same\n", __func__);
+                    #endif
+                    return 0;
+                }
+
+                if (!f_src || !f_dst || !rename_file(f_src, f_dst->name)){
+                    errno = ENOENT;
+                    return -1;
+                }
+
+                long nf = delete_file(idx_dst);
+                if (nf < 0) {
+                    errno = ENOENT;
+                    return -1;
+                }
+
+                return 0;
+
+            }
+            else {
+
+                #ifdef IVMFS_DEBUG_RENAME0
+                fprintf(stderr, "[%s] DIR -> FILE !! (ENOTDIR) \n", __func__);
+                #endif
+
+                errno = ENOTDIR;
+                return -1;
+            }
+        }
+        else {
+
+            if (!src_dir) {
+
+                #ifdef IVMFS_DEBUG_RENAME0
+                fprintf(stderr, "[%s] FILE -> DIR \n", __func__);
+                #endif
+
+                char *new_name = strdup(f_src->name);
+                char fullnewname[PATH_MAX+1];
+                long n = snprintf(fullnewname, PATH_MAX+1, "%s/%s",
+                                  f_dst->name, basename(new_name));
+                free(new_name);
+                if (n > PATH_MAX) {
+                    errno = ENAMETOOLONG;
+                    return -1;
+                }
+
+                if (0 == rename0_internal_new(f_src->name, fullnewname)){
+                    return 0;
+                }
+
+                errno = ENOENT;
+                return -1;
+            }
+            else {
+
+                #ifdef IVMFS_DEBUG_RENAME0
+                fprintf(stderr, "[%s] DIR -> DIR \n", __func__);
+                #endif
+
+                if (idx_dst >= 0 && idx_dst == idx_src) {
+                    #ifdef IVMFS_DEBUG_RENAME0
+                    fprintf(stderr, "[%s] new and old are the same\n", __func__);
+                    #endif
+                    return 0;
+                }
+
+                if (is_prefix_or_equal(f_src->name, f_dst->name)) {
+                    errno = EINVAL;
+                    return -1;
+                }
+
+                #define IVMFS_RENAME_DIR_POSIX
+
+                #ifdef IVMFS_RENAME_DIR_AS_MOVE
+
+                char fullnewname[PATH_MAX+1];
+                char *src_name_copy = strdup(f_src->name);
+                long n = snprintf(fullnewname, PATH_MAX+1, "%s/%s",
+                                  f_dst->name, basename(src_name_copy));
+                free(src_name_copy);
+                if (n > PATH_MAX) {
+                    errno = ENAMETOOLONG;
+                    return -1;
+                }
+
+                #ifdef IVMFS_DEBUG_RENAME0
+                fprintf(stderr, "[%s] trying to move '%s' -> fullnewname='%s'\n",
+                                 __func__, f_src->name, fullnewname);
+                #endif
+
+                if (find_dir(fullnewname) >= 0){
+                    #ifdef IVMFS_DEBUG_RENAME0
+                    fprintf(stderr, "[%s] fullnewname='%s' already exists\n",
+                                     __func__, fullnewname);
+                    #endif
+                    errno = EEXIST;
+                    return -1;
+                }
+
+                if (0 == rename0_internal_new(f_src->name, fullnewname)) {
+                    return 0;
+                }
+                #endif
+
+                #ifdef IVMFS_RENAME_DIR_POSIX
+
+                if (!is_empty_dir(f_dst->name)){
+                    errno = ENOTEMPTY;
+                    return -1;
+                }
+
+                char dst_copy[PATH_MAX];
+                strcpy(dst_copy, f_dst->name);
+                rmdir(f_dst->name);
+
+                #ifdef IVMFS_DEBUG_RENAME0
+                fprintf(stderr, "[%s] %s empty and removed; trying to move '%s' -> dst_copy='%s'\n",
+                                 __func__, f_dst->name, f_src->name, dst_copy);
+                #endif
+
+                if (0 == rename0_internal_new(f_src->name, dst_copy)) {
+                    return 0;
+                }
+                #endif
+
+                errno = ENOTEMPTY;
+                return -1;
+            }
+        }
+    }
+    else {
+
+        if (!src_dir) {
+
+            #ifdef IVMFS_DEBUG_RENAME0
+            fprintf(stderr, "[%s] FILE -> NEWFILE \n", __func__);
+            #endif
+
+            #ifdef IVMFS_DEBUG_RENAME0
+            fprintf(stderr, "[%s] newpath '%s' does NOT exist\n", __func__, dst);
+            #endif
+
+            if (rename_file(f_src, realdst)){
+                return 0;
+            } else {
+                #ifdef IVMFS_DEBUG_RENAME0
+                fprintf(stderr, "[%s] failed '%s' -> '%s'\n", __func__, f_src->name, realdst);
+                #endif
+                errno = ENOENT;
+                return -1;
+            }
+
+        }
+        else {
+
+            #ifdef IVMFS_DEBUG_RENAME0
+            fprintf(stderr, "[%s] DIR -> NEWDIR \n", __func__);
+            #endif
+
+            long n;
+
+            char *fullnewname = realdst;
+            if (!fullnewname) {
+
+                 errno = EFAULT;
+                 return -1;
+            }
+
+            if (file_in_dir(fullnewname) >= 0){
+
+                #ifdef IVMFS_DEBUG_RENAME0
+                fprintf(stderr, "[%s] Moving directory to file not allowed \n", __func__);
+                #endif
+                errno = EEXIST;
+                return -1;
+            }
+
+            if (!is_dirname_a_dir(fullnewname)){
+                 errno = ENOTDIR;
+                 return -1;
+            }
+
+            if (is_prefix_or_equal(f_src->name, fullnewname)) {
+                errno = EINVAL;
+                return -1;
+            }
+
+            #ifdef IVMFS_DEBUG_RENAME0
+            fprintf(stderr, "[%s] (canonicalized) oldpath='%s' newpath='%s' fullnewname='%s'\n",
+                      __func__, f_src->name, dst, fullnewname);
+            #endif
+
+            char *src_copy = strdup(f_src->name);
+
+            for (long idxi=0; idxi < filesystem->data.nfiles; idxi++){
+                file_t *fn =  &filesystem->data.filetable[idxi];
+                #ifdef IVMFS_DEBUG_RENAME0
+                fprintf(stderr,"[%s] Checking if entry '%s' has prefix '%s'?\n", __func__,fn->name, src_copy);
+                #endif
+                if (is_prefix_or_equal(src_copy, fn->name)) {
+                    #ifdef IVMFS_DEBUG_RENAME0
+                    fprintf(stderr,"[%s] Entry '%s' has prefix '%s'\n", __func__,fn->name, src_copy);
+                    #endif
+                    char *entryname =  fn->name;
+                    char buff[PATH_MAX+1];
+
+                    if ('\0' == entryname[strlen(src_copy)]){
+
+                        #ifdef IVMFS_DEBUG_RENAME0
+                        fprintf(stderr,"[%s] Replacing old dirname by '%s' \n", __func__, fullnewname);
+                        #endif
+                        n = snprintf(buff, PATH_MAX+1, "%s", fullnewname);
+                    } else {
+
+                        int start = 1;
+
+                        if (strlen(src_copy)==1) start = 0;
+                        #ifdef IVMFS_DEBUG_RENAME0
+                        fprintf(stderr,"[%s] Concatenating '%s' + '/%s' \n", __func__, fullnewname, &entryname[strlen(src_copy)+start]);
+                        #endif
+
+                        n = snprintf(buff, PATH_MAX+1, "%s/%s", fullnewname, &entryname[strlen(src_copy)+start]);
+                    }
+                    if (n > PATH_MAX)
+                    {
+                        free(src_copy);
+                        errno = ENAMETOOLONG;
+                        return -1;
+                    }
+                    if (!rename_file(fn, buff)) {
+                        free(src_copy);
+                        errno = ENOENT;
+                        return -1;
+                    }
+                }
+            }
+            free(src_copy);
+            return 0;
+        }
+    }
+
+    #ifdef IVMFS_DEBUG_RENAME0
+    #undef IVMFS_DEBUG_RENAME0
+    #endif
 }
 
 static int rename0(const char *oldpath, const char *newpath) {
     int ret = rename0_internal(oldpath, newpath);
     if (-1 != ret) {
 
-        char realnewpath[PATH_MAX+1];
+        char realnewpath[PATH_MAX], linknewpath[PATH_MAX];
         char *rl = realpath(newpath, realnewpath);
-        if (!rl || strlen(rl)>PATH_MAX){
-            errno = ENOENT;
-            return -1;
+        if (!rl) {
+
+            long l = readlink(newpath, linknewpath, PATH_MAX);
+            if (l<0) {
+                errno = ENOENT;
+                return -1;
+            }
         }
     }
     return ret;
@@ -2459,38 +3081,66 @@ int renameat0(int olddirfd, const char *oldpath, int newdirfd, const char *newpa
 
 static int truncate_internal(long idx, off_t length){
 
-    if (idx < 0) {
+    if (idx < 0 || idx >= filesystem->data.nfiles) {
         errno = ENOENT;
         return -1;
     }
 
     file_t *f = &filesystem->data.filetable[idx];
-    if (f->isdir){
+    if (IVMFS_ISDIR(f->type)){
         errno = EISDIR;
         return -1;
     }
-        #ifdef IVMFS_DEBUG
-        fprintf(stderr,"[%s] idx=%ld('%s') new length=%ld\n", __func__, idx, f->name, length);
-        #endif
+
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr,"[%s] idx=%ld ('%s') new length=%ld\n", __func__, idx, f->name, length);
+    #endif
 
     if (length < f->size){
         f->size = length;
     } else {
-        FILE *fh = fopen(f->name, "a");
-        if (fh){
 
-            long delta = length - f->size;
-            char null[1] = {'\0'};
-            long nw = 0;
-            for (long k=0; k<delta; k++){
+        int fd, alreadyopen = 0, cur_pos;
+        fd = find_fileno(idx);
 
-                nw += fwrite(null, 1, 1, fh);
-            }
-            if (nw < delta){
-                errno = EPERM;
+        if (fd >=0) {
+
+            #ifdef IVMFS_DEBUG
+            fprintf(stderr,"[%s] marked as already open idx=%ld('%s') fd=%d new length=%ld\n", __func__, idx, f->name, fd, length);
+            #endif
+            if (fd < 0) {
+                errno = ENOENT;
                 return -1;
             }
-            fclose(fh);
+            alreadyopen = 1;
+            cur_pos = get_position(fd);
+            set_position(fd, f->size);
+        } else {
+            fd = open(f->name, O_WRONLY | O_APPEND);
+        }
+
+        if (fd >= 0){
+
+            long delta = length - f->size;
+            long nw = 0;
+
+            char *zeros = (char*)calloc(delta, sizeof(char));
+            if (zeros) {
+                nw = write(fd, zeros, delta);
+                free(zeros);
+            }
+
+            if (alreadyopen) {
+
+                set_position(fd, cur_pos);
+            } else {
+                close(fd);
+            }
+
+            if (nw < delta){
+                errno = EFBIG;
+                return -1;
+            }
         } else {
             errno = EACCES;
             return -1;
@@ -2501,12 +3151,47 @@ static int truncate_internal(long idx, off_t length){
 
 static int truncate0(const char *path, off_t length)
 {
+
+    if (has_trail((char*)path)){
+        errno = ENOENT;
+        return -1;
+    }
+
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr,"[%s] path='%s' length=%ld\n", __func__, path, length);
+    #endif
+
     long idx = find_file((char *)path);
+
+    if (idx < 0 || IVMFS_ISLNK(filesystem->data.filetable[idx].type)){
+
+        static long trylink = 0;
+        if (!trylink) {
+
+            char linkname[PATH_MAX];
+            char *rl = realpath(path, linkname);
+            if (rl) {
+
+                trylink = 1;
+                int err = truncate(rl, length);
+                trylink = 0;
+                return err;
+            } else {
+                errno = ENOENT;
+                return -1;
+            }
+        }
+    }
+
     return truncate_internal(idx, length);
 }
 
 static int ftruncate0(int fd, off_t length)
 {
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr,"[%s] fd=%d length=%ld\n", __func__, fd, length);
+    #endif
+
     long idx = find_open_file(fd);
     return truncate_internal(idx, length);
 }
@@ -2526,16 +3211,7 @@ static int is_subdir(char *dirname, char* fullpath){
     #endif
 
     char dirname_copy[PATH_MAX+1];
-    long n;
-
-    if (dirname[strlen(dirname)-1] != '/'){
-        n = snprintf(dirname_copy, PATH_MAX+1, "%s/", dirname);
-    } else {
-        n = snprintf(dirname_copy, PATH_MAX+1, "%s", dirname);
-    }
-    if (n > PATH_MAX){
-        return 0;
-    }
+    strcpy(dirname_copy, dirname);
 
     if (strlen(fullpath) <= strlen(dirname_copy) ){
         return 0;
@@ -2545,7 +3221,7 @@ static int is_subdir(char *dirname, char* fullpath){
     fprintf(stderr, "[%s] dirname_copy='%s' \n", __func__, dirname_copy);
     #endif
 
-    long l = strlen(dirname_copy);
+    long l = strlen(dirname_copy) + 1;
     char *p = &fullpath[l];
 
     #ifdef IVMFS_DEBUG_IS_SUBDIR
@@ -2563,24 +3239,16 @@ static int is_subdir(char *dirname, char* fullpath){
         return 1;
     }
 
-    if (*p == '/'){
-
-        if (*(p+1) == '\0') {
-            #ifdef IVMFS_DEBUG_IS_SUBDIR
-            fprintf(stderr, "[%s] p='%s': '%s' IS immediate subdir of '%s'\n", __func__, p, fullpath, dirname);
-            #endif
-            return 1;
-        }
-    }
-
     #ifdef IVMFS_DEBUG_IS_SUBDIR
-    fprintf(stderr, "[%s] p='%s': '%s' no immediate subdir of '%s'\n\n", __func__, p, fullpath, dirname);
+    fprintf(stderr, "[%s] p='%s': '%s' no immediate subdir of '%s'\n\n",
+                    __func__, p, fullpath, dirname);
     #endif
 
     return 0;
 }
 
 static long getdents0(unsigned int fd, struct dirent *dirp, unsigned int count){
+    /* IVM64 struct dirent is defined in newlib/libc/include/sys/dirent.h*/
 
     struct dirent newdirent;
 
@@ -2590,10 +3258,44 @@ static long getdents0(unsigned int fd, struct dirent *dirp, unsigned int count){
         return -1;
     }
 
-    file_t *d = &filesystem->data.filetable[idx];
-    char *dirname =  d->name;
+    long pos = get_position(fd);
 
-    unsigned long i = get_position(fd);
+    file_t *d = &filesystem->data.filetable[idx];
+    char *dname = d->name;
+
+    #ifdef IVMFS_GETDENTS_RETURNS_DOT_DIRS
+
+    if ((0 == pos) || (1 == pos)) {
+        dirp[0].d_off = pos;
+        dirp[0].d_reclen = sizeof(struct dirent);
+        dirp[0].d_type = DT_DIR;
+        if (0 == pos) {
+
+            strcpy(dirp[0].d_name, ".");
+
+            dirp[0].d_ino = IVMFS_FIRST_INO() + idx;
+        } else if (1 == pos){
+
+            strcpy(dirp[0].d_name, "..");
+
+            char parentdir[PATH_MAX];
+            strcpy(parentdir, dname);
+            long idxp = find_dir_nocanon(dirname(parentdir));
+
+            if (idxp >=0)
+                dirp[0].d_ino = IVMFS_FIRST_INO() + idxp;
+            else
+                dirp[0].d_ino = -1;
+        }
+        set_position(fd, ++pos);
+        return sizeof(struct dirent);
+    }
+    #endif
+
+    long i = pos;
+    #ifdef IVMFS_GETDENTS_RETURNS_DOT_DIRS
+        i -=2;
+    #endif
 
     unsigned long *n = &filesystem->data.nfiles;
 
@@ -2603,21 +3305,30 @@ static long getdents0(unsigned int fd, struct dirent *dirp, unsigned int count){
             char *filename =  filesystem->data.filetable[i].name;
 
             #ifdef IVMFS_DEBUG_DELETED
-            if (!strncmp(dirname, filename, strlen(dirname)) || filename[0]=='*') break;
+            if (!strncmp(dname, filename, strlen(dname)) || filename[0]=='*') break;
             #else
-            if (!strncmp(dirname, filename, strlen(dirname)) && is_subdir(dirname,filename)) break;
+
+            if (is_prefix(dname, filename) && is_subdir(dname, filename)){
+                #ifdef IVMFS_DEBUG
+                long ldname = strlen(dname);
+                fprintf(stderr,"[%s] i=%ld dname='%s' ldname='%ld'\n", __func__, i, dname, ldname);
+                #endif
+                break;
+            }
             #endif
         }
         if (i < *n) {
             file_t *f = &filesystem->data.filetable[i];
 
             newdirent.d_ino = IVMFS_FIRST_INO() + i;
-            newdirent.d_off = 0;
+            newdirent.d_off = pos;
             newdirent.d_reclen = sizeof(struct dirent);
 
             newdirent.d_type = DT_REG;
-            if (f->isdir)
+            if (IVMFS_ISDIR(f->type))
                 newdirent.d_type = DT_DIR;
+            if (IVMFS_ISLNK(f->type))
+                newdirent.d_type = DT_LNK;
 
             char name_copy[PATH_MAX];
 
@@ -2629,31 +3340,65 @@ static long getdents0(unsigned int fd, struct dirent *dirp, unsigned int count){
             newdirent.d_name[NAME_MAX-1]='\0';
 
             #ifdef IVMFS_DEBUG
-            fprintf(stderr,"[%s] fullname='%s' name_copy='%s' dirent.d_name='%s'\n", __func__, f->name, name_copy, newdirent.d_name);
+            fprintf(stderr,"[%s] fullname='%s' name_copy='%s' dirent.d_name='%s'\n",
+                           __func__, f->name, name_copy, newdirent.d_name);
             #endif
 
             i++;
+
+            pos = i;
+            #ifdef IVMFS_GETDENTS_RETURNS_DOT_DIRS
+                pos +=2;
+            #endif
+            set_position(fd, pos);
+
             dirp[0] = newdirent;
-            set_position(fd, i);
-            return 1;
+            return 1*sizeof(newdirent);
         }
     }
-    set_position(fd, i);
+
+    pos = i;
+    #ifdef IVMFS_GETDENTS_RETURNS_DOT_DIRS
+        pos +=2;
+    #endif
+    set_position(fd, pos);
 
     return 0;
 }
 
-static void _seekdir0(DIR *dirp, long loc){
+static void _seekdir0(DIR *dirp, long loc)
+{
 
+    fid_t fd = dirfd(dirp);
+    long idx = find_open_file(fd);
+    if (-1 == idx) {
+        return;
+    }
+
+    lseek(fd, loc, SEEK_SET);
 }
 
-/* Functions resolve_path_internal() and realpath_internal() based on the newlib
-   routines by Werner Almesberger */
-/* This internal version does stat the file names or not
-   (only expand the path syntactically, in order to avoid
-   infinite recursions) depending on argument 'nocheck' */
+long telldir(DIR *dirp)
+{
+    fid_t fd = dirfd(dirp);
+
+    return lseek(fd, 0, SEEK_CUR);
+}
+
+void _cleanupdir(DIR *dirp)
+{
+    return;
+}
+
+/* Functions resolve_path_internal() and realpath_internal() based on the
+ * newlib routines by Werner Almesberger */
+/* This internal version does stat the file names or not (only expand the path
+ * syntactically, in order to avoid infinite recursions) depending on argument
+ * 'nocheck' */
 static int resolve_path_internal(char *path,char *result,char *pos, int nocheck)
 {
+    long max_link_length = PATH_MAX;
+
     if (*path == '/') {
         *result = '/';
         pos = result+1;
@@ -2677,10 +3422,15 @@ static int resolve_path_internal(char *path,char *result,char *pos, int nocheck)
         else {
             strcpy(pos,path);
             if (!nocheck) {
-                if (lstat(result,&st) < 0) return -1;
+                if (lstat_nocanon(result,&st) < 0) return -1;
                 if (S_ISLNK(st.st_mode)) {
                     char buf[PATH_MAX];
                     if (readlink(result,buf,sizeof(buf)) < 0) return -1;
+                    max_link_length -= strnlen(buf, sizeof(buf)) + 2;
+                    if (max_link_length <= 0) {
+                        errno = ELOOP;
+                        return -1;
+                    }
                     *pos = 0;
                     if (slash) {
                         *slash = '/';
@@ -2707,7 +3457,7 @@ static int resolve_path_internal(char *path,char *result,char *pos, int nocheck)
 static char *realpath_internal(const char *__restrict path, char *__restrict resolved_path, int nocheck)
 {
     char cwd[PATH_MAX];
-    char *path_copy;
+    char path_copy[PATH_MAX];
     int res;
 
     if (!path) {
@@ -2724,26 +3474,55 @@ static char *realpath_internal(const char *__restrict path, char *__restrict res
         errno = ENOENT; /* SUSv2 */
         return NULL;
     }
-    if (!getcwd(cwd,sizeof(cwd))) return NULL;
-    strcpy(resolved_path,"/");
-    if (resolve_path_internal(cwd,resolved_path,resolved_path, nocheck)) return NULL;
 
-    #if defined(__ivm64__) || defined(__linux_ivm64__)
+    int allocated = 0;
+    if (resolved_path == NULL) {
 
-    if (resolved_path[strlen(resolved_path)-1] != '/'){
-        strcat(resolved_path,"/");
+        allocated = 1;
+        resolved_path = (char * __restrict)malloc(PATH_MAX*sizeof(char));
+        if (!resolved_path) return NULL;
     }
+
+    #ifndef __ivm64__
+        if (!getcwd(cwd,sizeof(cwd))) {
+            if (allocated) free(resolved_path);
+            return NULL;
+        }
+        strcpy(resolved_path,"/");
+        if (resolve_path_internal(cwd,resolved_path,resolved_path, nocheck)) {
+            if (allocated) free(resolved_path);
+            return NULL;
+        }
+        strcat(resolved_path,"/");
     #else
-    strcat(resolved_path,"/");
+        if ('/' == path[0]) {
+
+            strcpy(cwd, "/");
+        } else {
+            if (!getcwd(cwd,sizeof(cwd))) {
+                if (allocated) free(resolved_path);
+                return NULL;
+            }
+            strcpy(resolved_path,"/");
+            if (resolve_path_internal(cwd,resolved_path,resolved_path, nocheck)) {
+                if (allocated) free(resolved_path);
+                return NULL;
+            }
+
+            if (resolved_path[strlen(resolved_path)-1] != '/'){
+                strcat(resolved_path,"/");
+            }
+        }
     #endif
 
-    path_copy = strdup(path);
-    if (!path_copy) return NULL;
+    strncpy(path_copy, path, PATH_MAX); path_copy[PATH_MAX-1]='\0';
     res = resolve_path_internal(path_copy,resolved_path,strchr(resolved_path,0), nocheck);
-    free(path_copy);
-    if (res) return NULL;
+    if (res) {
+        if (allocated) free(resolved_path);
+        return NULL;
+    }
 
-    #if defined(__ivm64__) || defined(__linux_ivm64__)
+    #ifdef __ivm64__
     if (!strcmp(resolved_path, "")){
         strcpy(resolved_path, "/");
     }
@@ -2754,36 +3533,116 @@ static char *realpath_internal(const char *__restrict path, char *__restrict res
 
 static char *realpath_nocheck(const char *path,char *resolved_path)
 {
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr, "[%s] path='%s'\n",__func__, path);
+    #endif
     return realpath_internal(path, resolved_path, 1);
 }
 
-char *realpath(const char * __restrict path, char * __restrict resolved_path)
+static char *realpath0(const char * __restrict path, char * __restrict resolved_path)
 {
     #ifdef IVMFS_DEBUG
     fprintf(stderr, "[%s] path='%s'\n",__func__, path);
     #endif
+
     return realpath_internal(path, resolved_path, 0);
 }
 
-/* This is the standard realpath() but does not check if path exists */
-ssize_t readlink0(const char *pathname, char *buf, size_t bufsiz) {
-    char buff[PATH_MAX], *rl;
+static char *realparentpath(const char *path, char *resolved_path)
+{
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr, "[%s] path='%s'\n",__func__, path);
+    #endif
+
+    if (!path || !*path){
+        #ifdef IVMFS_DEBUG
+        fprintf(stderr, "[%s] path='%s' (null or empty string)\n",__func__, path);
+        #endif
+        errno = EINVAL;
+        return NULL;
+    }
+
+    char path_notrail[PATH_MAX], trail[PATH_MAX];
+    remove_trail2((char*)path, path_notrail, trail);
+
+    char *pd, parent[PATH_MAX], parentrealpath[PATH_MAX], *rl;
+    strcpy(parent, path_notrail);
+    pd = dirname(parent);
+
+    rl = realpath(pd, parentrealpath);
+
+    if (!rl){
+        errno = EINVAL;
+        return NULL;
+    }
+
+    char *bn, buff2[PATH_MAX], buff3[PATH_MAX];
+    strcpy(buff2, path_notrail);
+    bn = basename(buff2);
+
+    strcpy(buff3, parentrealpath);
+    strcat(buff3, "/");
+    strcat(buff3, bn);
+
+    if (!*trail) {
+
+        rl = realpath_nocheck(buff3, resolved_path);
+
+    } else {
+
+        strcat(buff3, "/");
+        strcat(buff3, trail);
+        rl = realpath(buff3, resolved_path);
+    }
+
+    if (!rl){
+        errno = EINVAL;
+        return NULL;
+    }
+
+    return resolved_path;
+}
+
+static ssize_t readlink0(const char *pathname, char *buf, size_t bufsiz) {
+    #ifdef IVMFS_DEBUG
+    fprintf(stderr, "[%s] pathname='%s'\n",__func__, pathname);
+    #endif
+
+    if (!pathname || !*pathname){
+        #ifdef IVMFS_DEBUG
+        fprintf(stderr, "[%s] path='%s' (null or empty string)\n",__func__, pathname);
+        #endif
+        errno = EINVAL;
+        return -1;
+    }
+
     if (bufsiz <= 0){
         errno = EINVAL;
         return -1;
     }
 
-    rl = realpath_nocheck(pathname, buff);
-    if (rl) {
-        long n = snprintf(buf, (bufsiz>PATH_MAX)?PATH_MAX:bufsiz, "%s", rl);
-        buff[PATH_MAX-1] = '\0';
-        return n;
+    char pathname2[PATH_MAX], buff[PATH_MAX], *rl;
+    rl = realparentpath(pathname, pathname2);
+    if (!rl) {
+        errno = EINVAL;
+        return -1;
     }
 
+    rl = realpath_nocheck(pathname2, buff);
+
+    if (rl) {
+        long idx = find_file(rl);
+        if (idx >= 0 && IVMFS_ISLNK(filesystem->data.filetable[idx].type)) {
+            char *p = strncpy(buf, *(filesystem->data.filetable[idx].data), bufsiz);
+            return strlen(p);
+        }
+    }
+
+    errno = EINVAL;
     return -1;
 }
 
-ssize_t readlinkat0(int dirfd, const char *pathname, char *buf, size_t bufsiz)
+static ssize_t readlinkat0(int dirfd, const char *pathname, char *buf, size_t bufsiz)
 {
     char filenamebuff[PATH_MAX];
     int err = pathat(dirfd, pathname, filenamebuff, PATH_MAX);
@@ -2796,7 +3655,7 @@ ssize_t readlinkat0(int dirfd, const char *pathname, char *buf, size_t bufsiz)
     }
 }
 
-int dup0(int oldfd)
+static int dup0(int oldfd)
 {
 
     fid_t newfd = open("/", O_RDONLY | O_DIRECTORY);
@@ -2814,14 +3673,19 @@ int dup0(int oldfd)
     return -1;
 }
 
-int dup2_0(int oldfd, int newfd)
+static int dup2_0(int oldfd, int newfd)
 {
     #ifdef IVMFS_DEBUG
         fprintf(stderr, "[%s] dup2(%d, %d)\n", __func__, oldfd, newfd);
     #endif
 
-    long idx;
+    if (newfd < 0
+        || !is_valid_fileno(oldfd)){
+        errno = EBADF;
+        return -1;
+    }
 
+    long idx;
     if (filesystem->data.openfile[oldfd].dev == DEVDISK) {
         idx = find_open_file(oldfd) ;
         if (idx < 0){
@@ -2829,17 +3693,14 @@ int dup2_0(int oldfd, int newfd)
             errno = EBADF;
             return -1;
         }
-        if (filesystem->data.filetable[idx].isdir){
-            errno = EBADF;
-            return -1;
-        }
+
     }
 
     if (newfd == oldfd){
         return oldfd;
     }
 
-    if (newfd >= filesystem->data.openfile_size) {
+    if ((unsigned long)newfd >= filesystem->data.openfile_size) {
         openfile_t *of = reallocate_openfile(newfd);
         if (!of) {
             errno = EBADF;
@@ -2853,6 +3714,69 @@ int dup2_0(int oldfd, int newfd)
       filesystem->data.openfile[oldfd];
 
     return newfd;
+}
+
+static int symlink0(const char *target, const char *linkpath)
+{
+    if (!target || !*target || !linkpath || !*linkpath) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    if ((strnlen(target,PATH_MAX+1) > PATH_MAX) || (strnlen(linkpath,PATH_MAX+1) > PATH_MAX)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    long idx = find_file((char*)linkpath);
+    if (idx >= 0){
+        errno = EEXIST;
+        return -1;
+    }
+
+    int fid = open((char*)linkpath, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fid >= 0) {
+
+        write(fid, target, strlen(target)+1);
+
+        idx = filesystem->data.openfile[fid].idx;
+        close(fid);
+        filesystem->data.filetable[idx].type = IVMFS_LNK;
+        return 0;
+    }
+
+    errno = ENOENT;
+    return -1;
+}
+
+static int symlinkat0(const char *target, int newdirfd, const char *linkpath)
+{
+    char newpathbuff[PATH_MAX];
+    int err = pathat(newdirfd, linkpath, newpathbuff, PATH_MAX);
+
+    if (!err) {
+        return symlink(target, newpathbuff);
+    }
+
+    errno = ENOENT;
+    return -1;
+}
+
+static int isatty0(int fd)
+{
+    if (!is_valid_fileno(fd)) {
+        errno=EBADF;
+        return 0;
+    }
+    if (filesystem->data.openfile[fd].open
+        && (filesystem->data.openfile[fd].dev == DEVSTDIN
+            || filesystem->data.openfile[fd].dev == DEVSTDOUT
+            || filesystem->data.openfile[fd].dev == DEVSTDERR))
+    {
+        return 1;
+    }
+    errno=ENOTTY;
+    return 0;
 }
 
 ssize_t getdents64(int fd, void *dirp, size_t count)
@@ -2880,6 +3804,52 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
 {
     errno = ENOSYS;
     return -1;
+}
+
+void debug_print_file_table(){
+    for (long idx=0; idx < filesystem->data.nfiles; idx++){
+        file_t *f = &filesystem->data.filetable[idx];
+        printf("idx=%ld [%c], filename='%s'\n", idx, (f->type==IVMFS_REG)?'r':(f->type==IVMFS_DIR)?'d':'l', f->name);
+    }
+}
+
+void debug_print_open_file_table(){
+    for (int fid = 0; fid < filesystem->data.openfile_size; fid++) {
+        openfile_t *fo = &filesystem->data.openfile[fid];
+        if (fo->open){
+            const char *name = "n/a";
+            long size= -1;
+            long allocated = 0;
+            long idx = filesystem->data.openfile[fid].idx;
+            if (idx >= 0){
+                file_t *f = &filesystem->data.filetable[idx];
+                name = f->name;
+                size = f->size;
+                allocated = f->allocated;
+            }
+            fprintf(stdout, "fid=%d idx=%ld name='%s' pos=%ld size=%ld allocated=%ld\n", fid, idx, name, fo->pos_p?(*fo->pos_p):-1, size, allocated);
+        }
+    }
+}
+
+int debug_has_trail(char *a){
+    return has_trail(a);
+}
+
+char *debug_remove_trail2(char *a, char *b, char *c){
+    return remove_trail2(a, b, c);
+}
+
+char *debug_realpath_nocheck(const char *a, char *b){
+    return realpath_nocheck(a,b);
+}
+
+char *debug_realparentpath(const char *a, char *b){
+    return realparentpath(a,b);
+}
+
+long debug_get_spawnlevel(){
+    return filesystem->data.spawn_level;
 }
 
 #ifdef __cplusplus

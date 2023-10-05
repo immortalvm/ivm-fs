@@ -50,7 +50,7 @@ The stdin can be simulated using the file defined by
 
 ## Compilation options:
 
-```ivm64-gcc -DIVMFS_DEBUG ivmfs.c ...             # print information for each file operation ```
+<!--- ```ivm64-gcc -DIVMFS_DEBUG ivmfs.c ...             # print information for each file operation ``` --->
 
 ```ivm64-gcc -DIVMFS_DUMPFILES ivmfs.c ...         # dump a list of files when the program exits ```
 
@@ -70,6 +70,7 @@ mkdir mkdirat chdir fchdir getdents
 unlink unlinkat rmdir
 rename renameat dup dup2
 readlink realpath
+symlink symlinkat
 ```
 
 In addition to these, common higher filesystem functions from the C standard
@@ -77,13 +78,13 @@ library implemented by newlib can be used, such as:
 
 ```
 fopen fclose fread fwrite fileno feof
-printf scanf fscanf fprintf
-opendir readdir scandir dirfd, ...
+printf fprintf scanf fscanf 
+opendir readdir scandir dirfd ...
 ```
 
 Developers need keep in mind that this filesystem provides a **relaxed** implementation of the primitives, so all the potential described in POSIX manuals may not be available. 
 
-Soft/hard links and special file types are not yet supported. File permissions and ownership are not available either.
+Hard links and special file types are not yet supported. File permissions and ownership are not available either.
 
 
 Date: Jun 2023
