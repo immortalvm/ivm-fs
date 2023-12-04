@@ -1,6 +1,8 @@
 #Usage:
 #    CC=/path/to/ivm64-gcc make
 
+IVM_FSGEN:=$(if $(IVM_FSGEN),$(IVM_FSGEN),../ivm64-fsgen)
+
 run: minigzip
 	LD_LIBRARY_PATH=. ./minigzip  -c -d file.gz
 
@@ -11,7 +13,7 @@ ivmfs.c:
 	echo "Hello\nworld!" > hello.txt
 	gzip hello.txt
 	mv hello.txt.gz file.gz
-	../ivmfs-gen.sh file.gz > $@ 
+	$(IVM_FSGEN) file.gz > $@
 
 libminiz.so:
 	$(CC) -shared -fPIC zlib-1.2.11/*.c -Izlib-1.2.11/ -o $@ 

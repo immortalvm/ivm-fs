@@ -16,12 +16,14 @@ WORKINGDIR=./run
 CFLAGS_DEF = -O2
 CFLAGS := $(if $(CFLAGS),$(CFLAGS),$(CFLAGS_DEF))
 
+IVM_FSGEN:=$(if $(IVM_FSGEN),$(IVM_FSGEN),../ivm64-fsgen)
+
 all: checkenv
 	@echo Making working folder \"$(WORKINGDIR)\"
 	mkdir -p $(WORKINGDIR)
 	#
 	@echo Creating c static filesystem:
-	../ivmfs-gen.sh hello1.txt hello2.txt hello3.txt stdin > $(WORKINGDIR)/ivmfs.c
+	$(IVM_FSGEN) hello1.txt hello2.txt hello3.txt stdin > $(WORKINGDIR)/ivmfs.c
 	@echo And copying files for standard gcc:
 	cp hello1.txt hello2.txt hello3.txt stdin $(WORKINGDIR) 
 	#
@@ -30,9 +32,20 @@ all: checkenv
 	cd $(WORKINGDIR); ./a.out < stdin
 
 # check environment if compiler $(CC) is ivm64-gcc
-checkenv:
-	@if echo $(CC) | grep ivm64 > /dev/null && ! which ivm >/dev/null; then  echo "ivm application not found in PATH"; exit 1; else exit 0; fi
-	@if echo $(CC) | grep ivm64 > /dev/null && test -z "$$IVM_EMU"; then echo 'export variable IVM_EMU with your favourite ivm emulator; e.g. export IVM_EMU="ivm run", export IVM_EMU=/path/to/ivm_emu_fast'; exit 1; else exit 0; fi
+checkenv: check-ivm64-gcc check-ivm64-gpp check-ivm64-as check-ivm64-emu
+
+check-ivm64-gcc:
+	@which $(CC) >/dev/null || (echo $(CC) compiler not found in PATH; exit 1)
+
+check-ivm64-gpp:
+	@which $(CXX) >/dev/null || (echo $(CXX) compiler not found in PATH; exit 1)
+
+check-ivm64-as:
+	@which `echo $$IVM_AS | cut -d' ' -f1 ` >/dev/null || which ivm64-as >/dev/null || which ivm >/dev/null || (echo Neither variable IVM_AS is a valid IVM assembler, nor applications 'ivm64-as' or 'ivm' can be found in PATH ; exit 1)
+
+check-ivm64-emu:
+	@which `echo $$IVM_EMU | cut -d' ' -f1` >/dev/null || which ivm64-emu >/dev/null || which ivm >/dev/null || (echo Neither variable IVM_EMU is a valid IVM emulator, nor applications 'ivm64-emu' or 'ivm' can be found in PATH ; exit 1)
+
 
 clean:
 	rm -rf ./run
