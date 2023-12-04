@@ -17,7 +17,7 @@ Note that files or directories are added individually to the filesystem and, the
 
 ## Compiling
  
-Once the filesystem is generate, you can link a program with the generated C containing the filesystem, so that the primitives included in it will replace those of newlib, therefore enabling to access the
+Once the filesystem is generated, you can link a program with the generated C containing the filesystem, so that the primitives included in it will replace those of newlib, therefore enabling to access the
 files in a stardard way:
 
 ```ivm64-gcc ivmfs.c main.c ```   ```    #compile ivmfs.c before libraries```
