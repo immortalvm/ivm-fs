@@ -58,7 +58,7 @@
 #  Oscar Plata Gonzalez
 #  * University of Malaga
 #
-# Date: Ago 2020 - Jun 2023
+# Date: Ago 2020 - Feb 2024
 
 cmdline="`basename $0` $@"
 print_header(){
@@ -148,8 +148,8 @@ char* strdup (const char* s);
 
 // Set this to 1 to make read() emulate some tty features
 // (echo, cannonical mode)
-#ifndef IVMFS_TERMIOS
-#define IVMFS_TERMIOS 0
+#ifndef IVM_TERMIOS
+#define IVM_TERMIOS 1
 #endif
 
 // To be used by termios related stuff
@@ -248,6 +248,9 @@ typedef struct {
     unsigned long allocated;
     filetype_t type; // it's a directory
     int nameallocated; // the file has been renamed (allocating the new string)
+#ifdef IVMFS_DUMPFILES
+    unsigned long accallocated; // cumulative allocated bytes (sum of all reallocs)
+#endif
 } file_t;
 
 #define IVMFS_ISREG(a) ((a) == IVMFS_REG)
@@ -283,10 +286,29 @@ print_files() {
     elif test $PACK -eq 8; then
         # Dump 8-byte words (hexdump not supporting 16/8, so concatenating parts with sed)
         hdf() { hexdump -v -e '16/4 "0x%08x, " "\n"' < "$1" | sed -E 's/, 0x +//g' | sed -E 's/0x([0-9a-f]+)\s*,\s*0x([0-9a-f]+)/0x\2\1/g'; }
+
+        # The same, but with some unrolling for higher performance
+        hdf8n() { hexdump -v -e '16/4 "%08x " "\n"' < "$1" |
+                  gawk '{ 
+                          if (length($2 )) {printf "0x%s%s, ",  $2, $1;}  else {printf "0x00000000%s, ", $1}
+                          if (length($4 )) {printf "0x%s%s, ",  $4, $3;}  else {printf "0x00000000%s, ", $3}
+                          if (length($6 )) {printf "0x%s%s, ",  $6, $5;}  else {printf "0x00000000%s, ", $5}
+                          if (length($8 )) {printf "0x%s%s, ",  $8, $7;}  else {printf "0x00000000%s, ", $7}
+                          if (length($10)) {printf "0x%s%s, ", $10, $9;}  else {printf "0x00000000%s, ", $9}
+                          if (length($12)) {printf "0x%s%s, ", $12, $11;} else {printf "0x00000000%s, ", $11}
+                          if (length($14)) {printf "0x%s%s, ", $14, $13;} else {printf "0x00000000%s, ", $13}
+                          if (length($16)) {printf "0x%s%s,",  $16, $15;} else {printf "0x00000000%s,",  $15}
+                          print ""
+                        }'  ; 
+                }
+        hdf() { hdf8n "$@" ; }
     else
         # Dump bytes
         hdf() { hexdump -v -e '16/1 "%d, " "\n"' < "$1" | sed 's/, *,//g'; }
     fi
+
+
+
 
     # Associative arrays for file table entries
     declare -A file_entry
@@ -351,7 +373,7 @@ print_files() {
             filename=$(realpath "$1")
         else
             rpath="$(realpath --relative-to=. "$1")"
-            if [[ "$rpath" =~ ^[^.] ]] ; then
+            if [[ "$rpath" =~ ^[^.] ]] || [[ "$rpath" =~ ^[.][^/.] ]] || [[ "$rpath" =~ ^[.][.][^/] ]] ; then
                 #Filename relative to .
                 ivmfsroot=IVMFSROOT\"/\"
                 filename="$rpath"
@@ -480,7 +502,6 @@ typedef struct {
     struct termios tty_termios;
 
     long spawn_level;
-    int close_all_done;
 
     int *errno_p;
 
@@ -590,7 +611,6 @@ static filesystem_t filesystem0 = {
         cwd: (char*)IVMFSROOT,
         tty_termios: {},
         spawn_level: 0,
-        close_all_done: 0,
         errno_p: NULL,
     },
 };
@@ -610,15 +630,15 @@ cat << EEOOFF
 
 long __IVM64_ivmfs_started__ = 0;
 
-__attribute__((constructor))
+__attribute__((constructor(110)))
 void __IVMFS_start__(void)
 {
     #ifdef IVMFS_DEBUG
     printf("[%s] IVMFS begins ...\n", __func__);
     #endif
 
-    if (__IVM64_ivmfs_started__) return;
-    __IVM64_ivmfs_started__ = 1;
+    __IVM64_ivmfs_started__++;
+    if (__IVM64_ivmfs_started__ != 1) return;
 
     filesystem->data.errno_p = &errno;
 
@@ -667,12 +687,20 @@ void __IVMFS_start__(void)
     #endif
 }
 
-__attribute__((destructor))
+__attribute__((destructor(110)))
 void __IVMFS_end__(void)
 {
     #ifdef IVMFS_DEBUG
     printf("[%s] IVMFS ends ...\n", __func__);
     #endif
+
+    #ifdef IVMFS_DUMPFILES
+
+    dump_all_files();
+    #endif
+
+    __IVM64_ivmfs_started__--;
+    if (__IVM64_ivmfs_started__) return;
 
     if (filesystem->data.spawn_level > 0) {
 
@@ -685,7 +713,6 @@ void __IVMFS_end__(void)
     }
 
     filesystem->data.spawn_level = MAX(0,filesystem->data.spawn_level-1);
-
 }
 
 int open(const char *name, int flags, ...)
@@ -956,13 +983,14 @@ static uint8_t read_utf8char() {
     return buff[pos++];
 }
 
+#define UTF8_REPLACEMENT_CHAR ((uint32_t) 0xfffd)
+
 static void put_utf8char(uint8_t c) {
 /*
-From https:
-UNICODE        Binary scalar value         UTF-8
-000000-00007F  00000000 0xxxxxxx           0xxxxxxx                             US-ASCII
-000080-0007FF  00000yyy yyxxxxxx           110yyyyy 10xxxxxx                    Symbols of two bytes (first starting with 110, second with 10)
-000800-00FFFF  zzzzyyyy yyxxxxxx           1110zzzz 10yyyyyy 10xxxxxx           Symbols of 3 bytes (first starting with 1110, next with 10)
+From https://es.wikipedia.org/wiki/UTF-8
+000000-00007F  00000000 00000000 0xxxxxxx  0xxxxxxx                             US-ASCII
+000080-0007FF  00000000 00000yyy yyxxxxxx  110yyyyy 10xxxxxx                    Symbols of 2 bytes (first starting with 110, second with 10)
+000800-00FFFF  00000000 zzzzyyyy yyxxxxxx  1110zzzz 10yyyyyy 10xxxxxx           Symbols of 3 bytes (first starting with 1110, next with 10)
 010000-10FFFF  000uuuzz zzzzyyyy yyxxxxxx  11110uuu 10zzzzzz 10yyyyyy 10xxxxxx  Symbols of 4 bytes (first starting with 11110, next with 10)
 */
     static uint32_t w0, w1, w2, w3;
@@ -976,8 +1004,17 @@ UNICODE        Binary scalar value         UTF-8
         if (w0 < 0x80){
             ret = w0; /* xxxxxxx */
             goto to_console;
+        } else if ((c>=0xf8) || ((c>>6) == 2)) {
+            /*error*/
+            ret = UTF8_REPLACEMENT_CHAR;
+            goto to_console;
         }
         return;
+    }
+    else if ((c>>6) != 2) {
+        /*error*/
+        ret = UTF8_REPLACEMENT_CHAR;
+        goto to_console;
     }
     else if (pos == 1) {
         pos++;
@@ -1012,56 +1049,6 @@ UNICODE        Binary scalar value         UTF-8
 
         asm volatile ("load4! %0\n\tput_char": :"rm" (ret));
 
-        pos = 0;
-        return;
-}
-
-static void put_utf8char_old(uint8_t c) {
-    static int c0, c1, c2, c3;
-    static uint32_t u0, u1, u2, u3;
-    static int pos=0;
-    uint32_t ret = 0;
-
-    if (pos == 0) {
-        pos++;
-        c0 = c;
-        u0 = (uint32_t)c0;
-        if (c0 < 0x80){
-            ret = u0;
-            goto to_console;
-        }
-        u0 &= 0x1f;
-        return;
-    }
-    else if (pos == 1) {
-        pos++;
-        c1 = c;
-        u1 = (uint32_t)(c1 & 0x3f);
-        if (c0 < 0xe0) {
-            ret = (u0 << 6) + u1;
-            goto to_console;
-        }
-        return;
-    }
-    else if (pos == 2) {
-        pos++;
-        c2 = c;
-        u2 = (uint32_t)(c2 & 0x3f);
-        if (c0 < 0xf0) {
-            ret = (u0 << 12) + (u1 << 6) + u2;
-            goto to_console;
-        }
-        return;
-    }
-    else {
-        c3 = c;
-        u3 = (uint32_t)(c3 & 0x3f);
-        ret = (u0 << 18) + (u1 << 12) + (u2 << 6) + u3;
-    }
-
-    to_console:
-
-        asm volatile ("load4! %0\n\tput_char": :"rm" (ret));
         pos = 0;
         return;
 }
@@ -1145,7 +1132,6 @@ static int is_valid_fileno(fid_t fid)
 
 static long find_open_file(fid_t fid)
 {
-
     if (fid < 0) {
         set_errno(EBADF);
         return -1;
@@ -1210,7 +1196,6 @@ static long remove_open_file(fid_t fid)
 
 static long remove_open_device(fid_t fid)
 {
-
     #ifdef IVMFS_DEBUG
     fprintf(stderr, "[%s] fid=%d\n", __func__, fid);
     #endif
@@ -1569,26 +1554,31 @@ static unsigned long dump_file_content(char *name)
 
 static void dump_all_files(void)
 {
+    static int dumped = 0;
+    if (dumped){ return; }
+    dumped = 1;
     fflush(NULL);
     fprintf(stderr, "\n");
+    fprintf(stderr, "\n=======================================\n");
     for (long idx=0; idx<filesystem->data.nfiles; idx++){
         char *name = filesystem->data.filetable[idx].name;
         unsigned long size = filesystem->data.filetable[idx].size;
+        unsigned long allocated = filesystem->data.filetable[idx].allocated;
+        unsigned long accallocated = allocated?filesystem->data.filetable[idx].accallocated:0;
         int dir = IVMFS_ISDIR(filesystem->data.filetable[idx].type);
-        fprintf(stderr, "\n=======================================\n");
         if ('*' == name[0])
-            fprintf(stderr, "filetable[%ld]: '%s' [free entry]\n", idx, name);
+            fprintf(stderr, "[%ld] '%s' [free entry]\n", idx, name);
         else if ('#' == name[0])
-            fprintf(stderr, "filetable[%ld]: '%s' [deleted, not free yet]\n", idx, name);
+            fprintf(stderr, "[%ld] '%s' [deleted, not free yet]\n", idx, name);
         else if (dir)
-            fprintf(stderr, "filetable[%ld]: '%s' [dir]\n", idx, name);
+            fprintf(stderr, "[%ld] '%s' [dir]\n", idx, name);
         else
-            fprintf(stderr, "filetable[%ld]: '%s' %ld bytes\n", idx, name, size);
-        fprintf(stderr, "=======================================\n");
+            fprintf(stderr, "[%ld] '%s' %ld bytes [allocated %ld bytes, cumulative reallocation %ld bytes]\n", idx, name, size, allocated, accallocated);
     #ifdef IVMFS_DUMPFILECONTENTS
         unsigned long l=dump_file_content(name);
     #endif
     }
+    fprintf(stderr, "=======================================\n");
 }
 #endif
 
@@ -1629,7 +1619,7 @@ static int pathat(int dirfd, const char *pathname, char *buff, long size)
     }
     dirname[PATH_MAX-1] = '\0';
 
-    if (strlen(dirname)+ lp +1 > size) {
+    if (strlen(dirname)+ lp + 2 > size) {
 
         return -1;
     }
@@ -1723,6 +1713,9 @@ static long create_new_file(const char *name, int flags) {
         filesystem->data.filetable[idx].size = 0;
 
         filesystem->data.filetable[idx].allocated = 0;
+#ifdef IVMFS_DUMPFILES
+        filesystem->data.filetable[idx].accallocated = 0;
+#endif
         filesystem->data.filetable[idx].type = IVMFS_REG;
         if (flags & O_DIRECTORY){
            filesystem->data.filetable[idx].type = IVMFS_DIR;
@@ -2055,7 +2048,7 @@ static ssize_t read0(fid_t fid, void *vbuf, size_t len)
         long i = 0;
         unsigned char ch;
         do {
-            #if (!IVMFS_TERMIOS)
+            #if (!IVM_TERMIOS)
                 ch = read_char();
             #else
                 unsigned long lflag = filesystem->data.tty_termios.c_lflag;
@@ -2266,9 +2259,10 @@ static ssize_t write0(fid_t fid, const void *vptr, size_t nbytes)
                 *p = (char *)malloc(allocated * sizeof(char));
                 if (!p || !(*p)){
                     #ifdef IVMFS_DEBUG
-                        fprintf(stderr, "[%s] not enough space allocating %ld bytes\n", __func__, allocated);
+                        fprintf(stderr, "[%s] not enough space allocating %ld bytes (pos=%ld, nbytes=%ld)\n",
+                                __func__, allocated,  get_position(fid), nbytes);
                     #endif
-                    set_errno(EBADF);
+                    set_errno(ENOSPC);
                     return  -1;
                 }
 		        filesystem->data.filetable[idx].allocated = allocated;
@@ -2282,27 +2276,35 @@ static ssize_t write0(fid_t fid, const void *vptr, size_t nbytes)
                     fprintf(stderr, "[%s] allocated %ld bytes\n", __func__, allocated);
                 #endif
 
+				#ifdef IVMFS_DUMPFILES
+                    filesystem->data.filetable[idx].accallocated += allocated;
+				#endif
+
             } else {
 
-                unsigned int finalbyte = get_position(fid) + nbytes - 1;
+                unsigned long finalbyte = get_position(fid) + nbytes;
                 if (finalbyte >= filesystem->data.filetable[idx].allocated) {
 
-                    allocated = BLKSIZE *((finalbyte + 1)/BLKSIZE + 1 + EXTRABLKS);
+                    allocated = BLKSIZE *((finalbyte + finalbyte/2 + 1)/BLKSIZE + 1 + EXTRABLKS);
                     char **p = filesystem->data.filetable[idx].data;
                     char *newp = (char *)realloc(*(filesystem->data.filetable[idx].data), allocated * sizeof(char));
 
                     if (!newp){
                     #ifdef IVMFS_DEBUG
-                        fprintf(stderr, "[%s] error re-allocating %ld bytes %s\n",
-                         __func__, allocated, (get_errno()==ENOMEM)?"(ENOMEM)":"");
+                        fprintf(stderr, "[%s] error re-allocating %ld bytes %s (pos=%ld, nbytes=%ld)\n",
+                         __func__, allocated, (get_errno()==ENOMEM)?"(ENOMEM)":"", get_position(fid), nbytes);
                     #endif
-                        set_errno(EBADF);
+                        set_errno(ENOSPC);
                         return  -1;
                     }
 
                     *p = newp;
                     filesystem->data.filetable[idx].allocated = allocated;
                     filesystem->data.filetable[idx].data = p;
+
+					#ifdef IVMFS_DUMPFILES
+                    filesystem->data.filetable[idx].accallocated += allocated;
+					#endif
 
                     #ifdef IVMFS_DEBUG
                         fprintf(stderr, "[%s] re-allocated %ld bytes\n", __func__, allocated);
@@ -4143,30 +4145,6 @@ void debug_print_open_file_table(){
             fprintf(stdout, "fid=%d idx=%ld name='%s' pos=%ld size=%ld allocated=%ld\n", fid, idx, name, fo->pos_p?(*fo->pos_p):-1, size, allocated);
         }
     }
-}
-
-int debug_has_trail(char *a){
-    return has_trail(a);
-}
-
-char *debug_remove_trail2(char *a, char *b, char *c){
-    return remove_trail2(a, b, c);
-}
-
-char *debug_realpath_nocheck(const char *a, char *b){
-    return realpath_nocheck(a,b);
-}
-
-char *debug_realparentpath(const char *a, char *b){
-    return realparentpath(a,b);
-}
-
-long debug_get_spawnlevel(){
-    return filesystem->data.spawn_level;
-}
-
-void* debug_get_errno_p(){
-    return (void*)filesystem->data.errno_p;
 }
 
 #ifdef __cplusplus
